@@ -1,0 +1,42 @@
+# twifork is a maintained fork of twikit; it still exposes the `twikit` module
+# (from twikit import Client), but its x_client_transaction parser is updated
+# for X's current ondemand.s.js bundle structure. Plain `twikit` (latest
+# published: 2.3.3) cannot locate the KEY_BYTE indices against the current
+# page and fails with "Couldn't get KEY_BYTE indices" / "'ClientTransaction'
+# object has no attribute 'key'" during cookie login - installing bare
+# `twikit` instead of this fork is the #1 cause of that error. Pinned exactly
+# (not >=) because 2.3.5 is the specific version verified end-to-end (fresh
+# cookie login + GraphQL calls) against X's transaction-ID scheme as of
+# 2026-08-08 - bump deliberately and re-verify, don't let this float.
+twifork==2.3.5
+aiofiles>=23.2.1
+pandas>=2.2.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.1
+rich>=13.7.1
+loguru>=0.7.2
+typer>=0.12.3
+
+# optional - only imported lazily by app/llm.py, one per LLM_PROVIDER value.
+# Groq (LLM_PROVIDER=groq, the default) is the primary provider; Gemini
+# (LLM_PROVIDER=gemini) remains available as an alternative. If the selected
+# provider's SDK/API key isn't available, discovery reports a clear error
+# rather than falling back - there is no curated-account fallback.
+groq>=1.6.0
+google-genai>=0.3.0
+
+# dev / test
+pytest>=8.2.0
+pytest-asyncio>=0.23.7
+black>=24.4.2
+isort>=5.13.2
+ruff>=0.5.0
+
+# setup helper only (scripts/extract_chrome_cookies.py) - not imported by app/
+browser_cookie3>=0.19.1
+
+# UI (Streamlit dashboard) - only imported by streamlit_app.py/ui/*; the CLI
+# (main.py) has no dependency on these and keeps working without them.
+streamlit>=1.38
+plotly>=5.24

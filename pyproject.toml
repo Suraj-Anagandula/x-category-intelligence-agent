@@ -1,0 +1,73 @@
+[project]
+name = "x-profile-scraper"
+version = "0.1.0"
+description = "Modular, async collector for publicly available X (Twitter) user profile information."
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+    # twifork is a maintained fork of twikit - it still exposes the `twikit`
+    # module (`from twikit import Client`), but its x_client_transaction
+    # parser is updated for X's current ondemand.s.js bundle structure.
+    # Plain `twikit` (latest published: 2.3.3) cannot locate the KEY_BYTE
+    # indices against the current page and fails with "Couldn't get
+    # KEY_BYTE indices" / "'ClientTransaction' object has no attribute
+    # 'key'" during cookie login. Pinned exactly (not >=) because this is
+    # the specific version verified against X's current transaction-ID
+    # scheme as of 2026-08-08 - bump deliberately, not automatically.
+    "twifork==2.3.5",
+    "aiofiles>=23.2.1",
+    "pandas>=2.2.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "python-dotenv>=1.0.1",
+    "rich>=13.7.1",
+    "loguru>=0.7.2",
+    "typer>=0.12.3",
+]
+
+[project.optional-dependencies]
+llm = ["groq>=1.6.0", "google-genai>=0.3.0"]
+cookies = ["browser_cookie3>=0.19.1"]
+ui = ["streamlit>=1.38", "plotly>=5.24"]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.7",
+    "black>=24.4.2",
+    "isort>=5.13.2",
+    "ruff>=0.5.0",
+]
+
+[tool.setuptools]
+packages = ["app", "ui"]
+py-modules = ["main", "streamlit_app"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",
+    "UP017", # datetime.UTC alias is 3.11+; timezone.utc stays portable
+    "UP047", # PEP 695 generic syntax not required for readability here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"main.py" = ["B008"] # typer.Argument/Option calls as defaults are the intended pattern
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
