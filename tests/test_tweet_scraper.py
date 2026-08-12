@@ -6,6 +6,7 @@ from app.cache import TweetCache
 from app.config import Settings
 from app.exceptions import NetworkTimeoutError, ProtectedAccountError, RateLimitError
 from app.models import Tweet
+from app.time_window import resolve_time_window
 from app.tweet_scraper import TweetScraper
 
 
@@ -182,6 +183,92 @@ async def test_scrape_many_preserves_successful_results_alongside_rate_limited_f
     assert succeeded == 3
     assert rate_limited == 1
     assert other_failed == 1
+
+
+class _StubWindowAwareClient:
+    """Unlike `_StubClient` above, accepts the `window`/`max_pages` kwargs
+    `TweetScraper` passes through for a real (filtered) time window - used
+    only by the window-specific tests below, so `_StubClient`'s exact
+    original 2-arg signature (and every existing test using it) stays
+    untouched.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    async def get_recent_tweets(self, username: str, count: int = 10, window=None, max_pages=10):
+        self.calls.append((username, {"window": window, "max_pages": max_pages}))
+        return [Tweet(id=str(i), text=f"tweet {i}") for i in range(count)]
+
+
+def _window_scraper(tmp_path) -> tuple[TweetScraper, _StubWindowAwareClient]:
+    settings = _fast_settings(tmp_path)
+    client = _StubWindowAwareClient()
+    cache = TweetCache(
+        cache_dir=settings.tweet_cache_dir, ttl_seconds=settings.tweet_cache_ttl_seconds
+    )
+    return TweetScraper(settings, client, cache), client
+
+
+async def test_scrape_one_latest_mode_calls_client_without_window_kwargs(tmp_path) -> None:
+    """The default latest-mode call (no window given) must be indistinguishable
+    from the pre-time-window-feature call shape - no window/max_pages
+    kwargs reach the client at all."""
+    scraper, client = _window_scraper(tmp_path)
+
+    await scraper._scrape_one("elonmusk", count=5)
+
+    assert client.calls == [("elonmusk", {"window": None, "max_pages": 10})]
+
+
+async def test_scrape_one_real_window_passes_window_and_max_pages_through(tmp_path) -> None:
+    scraper, client = _window_scraper(tmp_path)
+    settings = scraper.settings
+    settings.tweet_window_max_pages = 7
+    window = resolve_time_window("7d")
+
+    await scraper._scrape_one("elonmusk", count=5, window=window)
+
+    assert len(client.calls) == 1
+    called_username, kwargs = client.calls[0]
+    assert called_username == "elonmusk"
+    assert kwargs["window"] is window
+    assert kwargs["max_pages"] == 7
+
+
+async def test_scrape_one_real_window_bypasses_cache_read_and_write(tmp_path) -> None:
+    """A windowed fetch must never read from or write to the plain
+    "latest" cache - see app/tweet_scraper.py for why (cache is keyed by
+    username only, with one TTL meant for "most recent tweets")."""
+    scraper, client = _window_scraper(tmp_path)
+    window = resolve_time_window("7d")
+
+    first = await scraper._scrape_one("elonmusk", count=5, window=window)
+    second = await scraper._scrape_one("elonmusk", count=5, window=window)
+
+    assert first.from_cache is False
+    assert second.from_cache is False  # never served from cache
+    assert len(client.calls) == 2  # X was hit both times, no cache short-circuit
+
+
+async def test_scrape_many_passes_window_through_to_every_account(tmp_path) -> None:
+    scraper, client = _window_scraper(tmp_path)
+    window = resolve_time_window("24h")
+
+    await scraper.scrape_many(["a", "b"], count=3, window=window)
+
+    assert len(client.calls) == 2
+    assert all(kwargs["window"] is window for _, kwargs in client.calls)
+
+
+async def test_scrape_many_defaults_to_latest_when_no_window_given(tmp_path) -> None:
+    """Existing callers that don't pass `window` at all keep the exact
+    original "latest" behavior."""
+    scraper, client = _window_scraper(tmp_path)
+
+    await scraper.scrape_many(["a"], count=3)
+
+    assert client.calls == [("a", {"window": None, "max_pages": 10})]
 
 
 def test_tweet_scraper_uses_dedicated_concurrency_setting_not_profile_concurrency(

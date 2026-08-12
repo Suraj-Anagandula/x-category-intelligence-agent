@@ -29,6 +29,7 @@ from app.exceptions import (
 )
 from app.logger import get_logger
 from app.models import Tweet, UserProfile
+from app.time_window import TimeWindow, oldest_created_at
 
 logger = get_logger()
 
@@ -194,9 +195,36 @@ class TwikitProfileClient:
         return self._to_profile(username, user)
 
     async def get_recent_tweets(
-        self, username: str, count: int = 10, tweet_type: str = "Tweets"
+        self,
+        username: str,
+        count: int = 10,
+        tweet_type: str = "Tweets",
+        *,
+        window: TimeWindow | None = None,
+        max_pages: int = 10,
     ) -> list[Tweet]:
-        """Fetch a user's most recent public tweets.
+        """Fetch a user's public tweets.
+
+        With no `window` (or an unfiltered/"latest" one), this is exactly
+        the original behavior: a single page of up to `count` most-recent
+        tweets - no pagination, no behavior change for existing callers.
+
+        With a real (filtered) `window`, pages backward through Twikit's
+        cursor-based pagination (`Result.next()`) until one of:
+          (a) a fetched page's oldest tweet is already older than
+              `window.start` - every further page can only be older still,
+              so the window is now fully covered from the "old" side;
+          (b) X returns an empty page - no more tweets are available at
+              all (there is no guarantee X exposes arbitrarily old
+              history - see README for the real limitation);
+          (c) `max_pages` pages have been fetched - a safety bound so a
+              custom range far in an account's past can't trigger
+              unbounded requests.
+        Tweets are de-duplicated by id across pages. Returns the fetched
+        superset - NOT yet cut to the exact `[start, end)` range; callers
+        apply `app.time_window.filter_tweets_to_window` for that precise
+        boundary (this keeps "posts fetched" vs. "posts inside window"
+        distinctly countable for report metadata).
 
         `tweet_type` is one of Twikit's {'Tweets', 'Replies', 'Media', 'Likes'}.
         """
@@ -212,12 +240,48 @@ class TwikitProfileClient:
             raise UserNotFoundError(username)
 
         try:
-            raw_tweets = await self._client.get_user_tweets(user.id, tweet_type, count=count)
+            page = await self._client.get_user_tweets(user.id, tweet_type, count=count)
         except Exception as exc:  # noqa: BLE001
             raise _map_twikit_exception(exc, username) from exc
 
         # Twikit's `count` is a page-size hint, not a hard cap - the API can return more.
-        return [self._to_tweet(tweet) for tweet in raw_tweets][:count]
+        page_tweets = [self._to_tweet(tweet) for tweet in page][:count]
+
+        if window is None or not window.is_filtered:
+            return page_tweets
+
+        collected: list[Tweet] = list(page_tweets)
+        seen_ids = {tweet.id for tweet in page_tweets}
+        pages_fetched = 1
+
+        while True:
+            oldest = oldest_created_at(page_tweets)
+            if oldest is not None and oldest < window.start:
+                break  # window covered - every further page is only older
+            if pages_fetched >= max_pages:
+                logger.warning(
+                    f"@{username}: reached the {max_pages}-page pagination limit while "
+                    "fetching tweets for the selected time window - results for this "
+                    "account may not cover the full requested range."
+                )
+                break
+
+            try:
+                page = await page.next()
+            except Exception as exc:  # noqa: BLE001
+                raise _map_twikit_exception(exc, username) from exc
+
+            page_tweets = [self._to_tweet(tweet) for tweet in page]
+            if not page_tweets:
+                break  # X has no more tweets to give for this account
+
+            pages_fetched += 1
+            for tweet in page_tweets:
+                if tweet.id not in seen_ids:
+                    seen_ids.add(tweet.id)
+                    collected.append(tweet)
+
+        return collected
 
     @staticmethod
     def _to_tweet(raw: Any) -> Tweet:

@@ -6,9 +6,10 @@ This module builds the same client/cache/scraper/LLM objects `main.py`'s
 discovery, validation, ranking, scraping, retry/rate-limit handling, or
 analysis.
 
-Real-time stage progress is derived by tapping the pipeline's *existing*
-loguru log messages via a temporary sink (added before the run, removed
-after) - no callback/hook parameter is added to `app/category_agent.py`.
+Real-time stage progress is now driven by `run_pipeline`'s own `on_stage`
+callback parameter (a real hook, not string-matching against log output),
+so progress reflects real backend completion - never a simulated timer -
+and carries the real counts computed at each stage.
 """
 
 from __future__ import annotations
@@ -21,25 +22,10 @@ from app.category_agent import CategoryIntelligenceAgent
 from app.client import TwikitProfileClient
 from app.config import settings
 from app.llm import build_llm_client
-from app.logger import get_logger
 from app.schemas import CategoryReport
 from app.scraper import ProfileScraper
+from app.time_window import TimeWindow
 from app.tweet_scraper import TweetScraper
-
-logger = get_logger()
-
-#: (stage_key, log-message substring that marks it complete). Matched against
-#: the exact lines app/category_agent.py's run_pipeline already logs, so
-#: progress reflects real backend completion, never a simulated timer.
-STAGE_MARKERS: list[tuple[str, str]] = [
-    ("context", "Category context for"),
-    ("discovery", "Candidates discovered:"),
-    ("validation", "Profiles validated:"),
-    ("ranking", "Accounts selected:"),
-    ("tweets", "Tweet scrape summary:"),
-    ("analysis", "Analysis completed"),
-    ("export", "CSV:"),
-]
 
 #: Ordered stage keys + display labels, for rendering the 7-step checklist.
 PIPELINE_STAGES: list[tuple[str, str]] = [
@@ -70,6 +56,8 @@ async def _run_pipeline_async(
     candidate_limit: int,
     top_accounts: int,
     tweets_per_account: int,
+    on_stage: Callable[[str, dict], None] | None = None,
+    time_window: TimeWindow | None = None,
 ) -> CategoryReport:
     """Identical wiring to main.py's `_run_analyze()`."""
     settings.ensure_directories()
@@ -99,6 +87,8 @@ async def _run_pipeline_async(
         candidate_limit=candidate_limit,
         top_n=top_accounts,
         tweets_per_account=tweets_per_account,
+        on_stage=on_stage,
+        time_window=time_window,
     )
 
 
@@ -107,33 +97,29 @@ def run_category_analysis(
     candidate_limit: int,
     top_accounts: int,
     tweets_per_account: int,
-    on_stage: Callable[[str], None] | None = None,
+    on_stage: Callable[[str, dict], None] | None = None,
+    time_window: TimeWindow | None = None,
 ) -> CategoryReport:
     """Synchronous entry point for Streamlit callbacks.
 
     Runs the existing pipeline end to end and returns its `CategoryReport`
-    unchanged. If `on_stage` is given, it's called with each `STAGE_MARKERS`
-    key the moment the pipeline's own logging reports that stage complete.
+    unchanged. If `on_stage` is given, it's passed straight through to
+    `CategoryIntelligenceAgent.run_pipeline`, which calls it with
+    `(stage_key, payload)` the moment each stage actually completes -
+    `payload` carries real counts computed at that point (e.g.
+    `{"tweets_collected": 184}`), not just a completion marker.
+
+    `time_window` defaults to `None` -> `CategoryIntelligenceAgent.run_pipeline`
+    resolves that to "latest" (no filtering), so every existing caller that
+    doesn't pass it keeps the original "most recent available tweets"
+    behavior unchanged.
 
     Raises whatever `CategoryIntelligenceAgent.run_pipeline` raises
     (`AuthenticationError`, `LLMError`, or another `ScraperError`) - the
     caller handles these exactly as `main.py` already does.
     """
-    sink_id = None
-    if on_stage is not None:
-
-        def _progress_sink(message) -> None:
-            text = message.record["message"]
-            for stage_key, marker in STAGE_MARKERS:
-                if marker in text:
-                    on_stage(stage_key)
-
-        sink_id = logger.add(_progress_sink, level="INFO", format="{message}")
-
-    try:
-        return asyncio.run(
-            _run_pipeline_async(category, candidate_limit, top_accounts, tweets_per_account)
+    return asyncio.run(
+        _run_pipeline_async(
+            category, candidate_limit, top_accounts, tweets_per_account, on_stage, time_window
         )
-    finally:
-        if sink_id is not None:
-            logger.remove(sink_id)
+    )

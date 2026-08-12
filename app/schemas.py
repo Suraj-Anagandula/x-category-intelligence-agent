@@ -46,6 +46,34 @@ class RankedAccount(BaseModel):
     activity_score: float
     audience_score: float
     ranking_score: float
+    #: Why discovery surfaced this account (see `app/account_discovery.py`).
+    #: Optional/defaulted so older stored run snapshots (written before this
+    #: field existed) still parse - never assume every stored account dict
+    #: has it.
+    discovery_reason: str = ""
+
+
+class TimeWindowInfo(BaseModel):
+    """What time window this run actually analyzed - distinct from
+    `scraped_at`/the snapshot filename date, which record *when the run
+    happened* (collection time), not *which tweets it looked at* (analysis
+    window). `mode="latest"` (the default) means no window was applied -
+    the pipeline's original "most recent available tweets" behavior.
+
+    Optional/defaulted so pre-existing stored snapshots (written before
+    time-window support existed) still parse with `mode="latest"` and zero
+    counts rather than crashing - see `app/report_compare.py` and
+    `app/rag/indexer.py` for how readers treat a missing/default value.
+    """
+
+    mode: str = "latest"
+    start: datetime | None = None
+    end: datetime | None = None
+    #: Tweets actually fetched from X for this run, before window filtering.
+    posts_fetched: int = 0
+    #: Of those, how many satisfied `START <= created_at < END` - this is
+    #: the count that actually informed ranking/analysis/storage/RAG.
+    posts_in_window: int = 0
 
 
 class TweetStatistics(BaseModel):
@@ -82,6 +110,7 @@ class CategoryReport(BaseModel):
     analysis: CategoryAnalysis = Field(default_factory=CategoryAnalysis)
     errors: list[dict[str, str]] = Field(default_factory=list)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    time_window: TimeWindowInfo = Field(default_factory=TimeWindowInfo)
 
     def to_flat_dict(self) -> dict:
         return self.model_dump(mode="json")

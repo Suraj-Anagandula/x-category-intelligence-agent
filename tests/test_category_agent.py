@@ -6,6 +6,8 @@ is stubbed or monkeypatched - no real X/LLM credentials or network needed.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from app.category_agent import (
@@ -18,6 +20,7 @@ from app.config import Settings
 from app.exceptions import LLMError
 from app.models import ScrapeResult, Tweet, TweetScrapeResult, UserProfile
 from app.schemas import DiscoveredAccount
+from app.time_window import resolve_time_window
 
 
 def _discovered(*usernames: str) -> list[DiscoveredAccount]:
@@ -95,9 +98,11 @@ class _StubTweetScraper:
     def __init__(self, results: list[TweetScrapeResult]) -> None:
         self.results = results
         self.calls: list[tuple[list[str], int | None]] = []
+        self.windows: list[object] = []
 
-    async def scrape_many(self, usernames, count=None):
+    async def scrape_many(self, usernames, count=None, window=None):
         self.calls.append((list(usernames), count))
+        self.windows.append(window)
         return self.results
 
 
@@ -338,6 +343,197 @@ async def test_run_pipeline_requests_configured_tweets_per_account(monkeypatch, 
     await agent.run_pipeline("sports", tweets_per_account=10)
 
     assert tweet_scraper.calls[0][1] == 10
+
+
+def _tweet_at(hours_ago: float, tweet_id: str, username: str = "espn") -> Tweet:
+    created = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return Tweet(id=tweet_id, username=username, text=f"post {tweet_id}", created_at=created)
+
+
+class _AnalysisCallCountingLLMClient:
+    """Tracks calls to the category-analysis prompt specifically (the one
+    containing "trending_topics") - other prompts (context/relevance) are
+    answered normally so the rest of the pipeline still genuinely exercises
+    the LLM path. This isolates "was Groq called on an empty/filtered-out
+    tweet set" from "is an LLM configured at all"."""
+
+    def __init__(self) -> None:
+        self.analysis_calls = 0
+
+    async def generate_json(self, prompt: str):
+        if "trending_topics" in prompt:
+            self.analysis_calls += 1
+            return {
+                "trending_topics": ["should-not-appear"],
+                "sentiment": {"positive": 100, "neutral": 0, "negative": 0},
+                "summary": "should not happen",
+            }
+        if "subcategories" in prompt:
+            return {"subcategories": [], "keywords": []}
+        if "relevance" in prompt:
+            return {"relevance": 50.0}
+        return {}
+
+
+async def test_run_pipeline_defaults_time_window_to_latest_when_not_given(
+    monkeypatch, tmp_path
+) -> None:
+    """Backward compatibility: an existing caller that never mentions
+    `time_window` gets exactly the original "most recent tweets" behavior."""
+    settings = _settings(tmp_path)
+
+    async def fake_discover(category, keywords, limit, llm_client=None):
+        return _discovered("espn")
+
+    monkeypatch.setattr("app.category_agent.discover_candidates", fake_discover)
+
+    profile_results = [ScrapeResult(username="espn", success=True, profile=_profile("espn"))]
+    tweet_scraper = _StubTweetScraper(
+        [TweetScrapeResult(username="espn", success=True, tweets=[_tweet_at(1, "1")])]
+    )
+
+    agent = CategoryIntelligenceAgent(
+        settings=settings,
+        profile_scraper=_StubProfileScraper(profile_results),
+        tweet_scraper=tweet_scraper,
+        llm_client=None,
+    )
+
+    report = await agent.run_pipeline("sports")
+
+    assert report.time_window.mode == "latest"
+    assert report.tweet_statistics.tweets_collected == 1
+    assert tweet_scraper.windows[0].mode == "latest"
+
+
+async def test_run_pipeline_filters_tweets_to_the_selected_window(monkeypatch, tmp_path) -> None:
+    settings = _settings(tmp_path)
+
+    async def fake_discover(category, keywords, limit, llm_client=None):
+        return _discovered("espn")
+
+    monkeypatch.setattr("app.category_agent.discover_candidates", fake_discover)
+
+    profile_results = [ScrapeResult(username="espn", success=True, profile=_profile("espn"))]
+    # 2 hours ago (in a "last 24h" window), 48 hours ago (outside it).
+    tweets = [_tweet_at(2, "recent"), _tweet_at(48, "old")]
+    tweet_scraper = _StubTweetScraper(
+        [TweetScrapeResult(username="espn", success=True, tweets=tweets)]
+    )
+
+    agent = CategoryIntelligenceAgent(
+        settings=settings,
+        profile_scraper=_StubProfileScraper(profile_results),
+        tweet_scraper=tweet_scraper,
+        llm_client=None,
+    )
+
+    report = await agent.run_pipeline("sports", time_window=resolve_time_window("24h"))
+
+    assert report.tweet_statistics.tweets_collected == 1  # only the in-window tweet continues
+    assert report.time_window.posts_fetched == 2
+    assert report.time_window.posts_in_window == 1
+
+
+async def test_run_pipeline_populates_time_window_metadata_on_report(monkeypatch, tmp_path) -> None:
+    settings = _settings(tmp_path)
+
+    async def fake_discover(category, keywords, limit, llm_client=None):
+        return _discovered("espn")
+
+    monkeypatch.setattr("app.category_agent.discover_candidates", fake_discover)
+
+    profile_results = [ScrapeResult(username="espn", success=True, profile=_profile("espn"))]
+    tweet_scraper = _StubTweetScraper(
+        [TweetScrapeResult(username="espn", success=True, tweets=[_tweet_at(1, "1")])]
+    )
+
+    agent = CategoryIntelligenceAgent(
+        settings=settings,
+        profile_scraper=_StubProfileScraper(profile_results),
+        tweet_scraper=tweet_scraper,
+        llm_client=None,
+    )
+
+    window = resolve_time_window("7d")
+    report = await agent.run_pipeline("sports", time_window=window)
+
+    assert report.time_window.mode == "7d"
+    assert report.time_window.start == window.start
+    assert report.time_window.end == window.end
+
+
+async def test_run_pipeline_empty_window_produces_no_tweets_and_skips_llm_analysis(
+    monkeypatch, tmp_path
+) -> None:
+    """Section 13: an empty window must not crash, and must never send an
+    empty tweet set to Groq and pretend the response is meaningful - the
+    existing `analyze_category` guard (`if llm_client and tweets:`) must
+    still take effect once tweets have been filtered down to zero."""
+    settings = _settings(tmp_path)
+
+    async def fake_discover(category, keywords, limit, llm_client=None):
+        return _discovered("espn")
+
+    monkeypatch.setattr("app.category_agent.discover_candidates", fake_discover)
+
+    profile_results = [ScrapeResult(username="espn", success=True, profile=_profile("espn"))]
+    # Every tweet is 100 hours old - none fall inside a "last 24h" window.
+    tweet_scraper = _StubTweetScraper(
+        [TweetScrapeResult(username="espn", success=True, tweets=[_tweet_at(100, "1")])]
+    )
+    llm_client = _AnalysisCallCountingLLMClient()
+
+    agent = CategoryIntelligenceAgent(
+        settings=settings,
+        profile_scraper=_StubProfileScraper(profile_results),
+        tweet_scraper=tweet_scraper,
+        llm_client=llm_client,
+    )
+
+    report = await agent.run_pipeline("sports", time_window=resolve_time_window("24h"))
+
+    assert report.tweet_statistics.tweets_collected == 0
+    assert report.time_window.posts_fetched == 1
+    assert report.time_window.posts_in_window == 0
+    assert llm_client.analysis_calls == 0  # Groq was never called with the empty set
+    assert report.analysis.trending_topics != ["should-not-appear"]  # fell back, not fabricated
+
+
+async def test_run_pipeline_only_indexes_in_window_tweets_for_rag(monkeypatch, tmp_path) -> None:
+    """Section 11: posts outside the selected window must not become part
+    of the indexed evidence - verified here by injecting a recording
+    `rag_indexer` and checking exactly which tweets it receives."""
+    settings = _settings(tmp_path)
+
+    async def fake_discover(category, keywords, limit, llm_client=None):
+        return _discovered("espn")
+
+    monkeypatch.setattr("app.category_agent.discover_candidates", fake_discover)
+
+    profile_results = [ScrapeResult(username="espn", success=True, profile=_profile("espn"))]
+    tweets = [_tweet_at(2, "recent"), _tweet_at(48, "old")]
+    tweet_scraper = _StubTweetScraper(
+        [TweetScrapeResult(username="espn", success=True, tweets=tweets)]
+    )
+
+    indexed: list[Tweet] = []
+
+    def recording_indexer(tweets, category, scraped_at):
+        indexed.extend(tweets)
+        return len(tweets)
+
+    agent = CategoryIntelligenceAgent(
+        settings=settings,
+        profile_scraper=_StubProfileScraper(profile_results),
+        tweet_scraper=tweet_scraper,
+        llm_client=None,
+        rag_indexer=recording_indexer,
+    )
+
+    await agent.run_pipeline("sports", time_window=resolve_time_window("24h"))
+
+    assert [t.id for t in indexed] == ["recent"]
 
 
 async def test_run_pipeline_handles_zero_valid_candidates(monkeypatch, tmp_path) -> None:

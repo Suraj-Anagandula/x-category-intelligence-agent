@@ -29,6 +29,22 @@ dependencies = [
 llm = ["groq>=1.6.0", "google-genai>=0.3.0"]
 cookies = ["browser_cookie3>=0.19.1"]
 ui = ["streamlit>=1.38", "plotly>=5.24"]
+# Ask Intelligence (RAG) - only imported lazily by app/rag/*; the CLI and the
+# rest of the UI keep working with zero RAG dependencies installed. Not
+# pinned exactly (unlike twifork above) - no fragile reverse-engineered API
+# surface here. First real use downloads the sentence-transformers model
+# (all-MiniLM-L6-v2, ~80MB) plus the CPU torch wheel (several hundred MB).
+# torchvision is required transitively: sentence-transformers depends on
+# transformers, and transformers/models/zoedepth/image_processing_zoedepth.py
+# unconditionally imports `torchvision.transforms.v2` (not guarded behind an
+# is_torchvision_available() check in this transformers release) - without
+# it, certain transformers code paths raise ModuleNotFoundError even though
+# this project only ever uses a text embedding model, never vision models.
+# Left unpinned so pip's resolver keeps it paired with whichever torch
+# version sentence-transformers pulls in (torchvision's own metadata pins
+# an exact matching torch release per version, e.g. torchvision==0.28.0
+# requires torch==2.13.0 - pinning torchvision here too could fight that).
+rag = ["chromadb>=0.5.0", "sentence-transformers>=3.0.0", "torchvision>=0.17.0"]
 dev = [
     "pytest>=8.2.0",
     "pytest-asyncio>=0.23.7",

@@ -51,6 +51,13 @@ data/tweets/**/*.json
 !data/tweets/.gitkeep
 
 # ================================
+# Vector store (Ask Intelligence)
+# ================================
+# Derived/regenerable from data/tweets/* via scripts/backfill_rag_index.py -
+# never commit the index itself.
+.chroma/
+
+# ================================
 # Testing / Tooling
 # ================================
 .pytest_cache/

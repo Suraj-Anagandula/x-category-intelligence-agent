@@ -11,7 +11,53 @@ from app.utils import (
     normalize_username,
     read_usernames_from_file,
     retry_with_backoff,
+    split_errors_by_stage,
 )
+
+
+def test_split_errors_by_stage_separates_validation_from_pipeline_errors() -> None:
+    """Regression: candidate-discovery rejections (e.g. Cerner/Amwell
+    UserNotFoundError, PharmD ProtectedAccountError - all rejected before
+    ranking/selection) must never be reported as "pipeline failures" of
+    the final selected accounts."""
+    errors = [
+        {"stage": "validation", "username": "Cerner", "error_type": "UserNotFoundError"},
+        {"stage": "validation", "username": "Amwell", "error_type": "UserNotFoundError"},
+        {"stage": "validation", "username": "PharmD", "error_type": "ProtectedAccountError"},
+    ]
+
+    validation_errors, pipeline_errors = split_errors_by_stage(errors)
+
+    assert len(validation_errors) == 3
+    assert pipeline_errors == []
+
+
+def test_split_errors_by_stage_keeps_tweets_stage_as_pipeline_errors() -> None:
+    errors = [
+        {"stage": "validation", "username": "Cerner", "error_type": "UserNotFoundError"},
+        {"stage": "tweets", "username": "somebody", "error_type": "RateLimitError"},
+    ]
+
+    validation_errors, pipeline_errors = split_errors_by_stage(errors)
+
+    assert len(validation_errors) == 1
+    assert len(pipeline_errors) == 1
+    assert pipeline_errors[0]["username"] == "somebody"
+
+
+def test_split_errors_by_stage_never_double_counts() -> None:
+    errors = [
+        {"stage": "validation", "username": "a"},
+        {"stage": "tweets", "username": "b"},
+    ]
+
+    validation_errors, pipeline_errors = split_errors_by_stage(errors)
+
+    assert len(validation_errors) + len(pipeline_errors) == len(errors)
+
+
+def test_split_errors_by_stage_empty_input() -> None:
+    assert split_errors_by_stage([]) == ([], [])
 
 
 @pytest.mark.parametrize(

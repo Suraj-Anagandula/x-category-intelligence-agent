@@ -185,6 +185,75 @@ def test_select_top_n_returns_all_when_pool_smaller_than_n() -> None:
     assert len(top) == 1
 
 
+def test_relevance_floor_zeroes_out_other_components_below_the_floor() -> None:
+    """Direct proof of the root-cause math behind the real @hhs false
+    positive: category_relevance's weight (0.40) is smaller than
+    engagement+activity+audience's combined weight (0.60), so without a
+    floor, an account with ZERO real category relevance but maxed-out
+    engagement/activity/audience could still out-rank a genuinely relevant
+    account that has none of those. With the floor, its score must be
+    exactly `relevance_w * relevance` - the other three contribute nothing."""
+    maxed_but_irrelevant = _profile(
+        username="maxed_but_irrelevant",
+        display_name="Unrelated",
+        bio="Nothing to do with the category.",
+        followers=50_000_000,
+        tweets=10_000,
+        likes=100_000,
+        created_at=datetime.now(timezone.utc) - timedelta(days=100),
+    )
+    relevant_but_bare = _profile(
+        username="relevant_but_bare",
+        display_name="On Topic",
+        bio="sports championship athletes cricket football",
+        followers=0,
+        tweets=None,
+        likes=None,
+        created_at=None,
+    )
+
+    ranked = rank_accounts(
+        [maxed_but_irrelevant, relevant_but_bare],
+        _ctx(),
+        relevance_scores={"maxed_but_irrelevant": 0.0},
+    )
+
+    by_username = {a.username: a for a in ranked}
+    assert by_username["maxed_but_irrelevant"].ranking_score == 0.0
+    assert by_username["relevant_but_bare"].ranking_score > 0.0
+    assert ranked[0].username == "relevant_but_bare"
+
+
+def test_relevance_floor_leaves_accounts_above_the_floor_unaffected() -> None:
+    """An account that clears the floor keeps the exact same weighted-sum
+    formula as before - the floor never affects a genuinely relevant,
+    high-engagement account."""
+    profiles = [_profile(username="a", followers=100, tweets=10)]
+
+    ranked = rank_accounts(profiles, _ctx(), relevance_scores={"a": 50.0})
+
+    engagement = compute_engagement_score(profiles[0])
+    activity = compute_activity_score(profiles[0])
+    audience = compute_audience_score(profiles[0])
+    expected = round(0.40 * 50.0 + 0.25 * engagement + 0.20 * activity + 0.15 * audience, 2)
+    assert ranked[0].ranking_score == expected
+
+
+def test_rerank_with_tweet_engagement_also_applies_the_relevance_floor() -> None:
+    """The floor must hold even after real per-tweet engagement replaces
+    the profile-level proxy - a high-engagement account's real tweets
+    still can't compensate for near-zero category relevance."""
+    profiles = [_profile(username="low_relevance", followers=100, tweets=10)]
+    ranked = rank_accounts(profiles, _ctx(), relevance_scores={"low_relevance": 5.0})
+
+    huge_engagement_tweets = [
+        Tweet(id="1", text="x", like_count=1_000_000, retweet_count=500_000, reply_count=100_000)
+    ]
+    updated = rerank_with_tweet_engagement(ranked, {"low_relevance": huge_engagement_tweets})
+
+    assert updated[0].ranking_score == round(0.40 * 5.0, 2)
+
+
 def test_rerank_with_tweet_engagement_updates_score_and_order() -> None:
     profiles = [
         _profile(username="a", followers=100, tweets=10),

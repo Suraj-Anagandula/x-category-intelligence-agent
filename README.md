@@ -36,6 +36,15 @@ use this tool.
 - Rich progress bar + summary table; structured logging to `data/logs/`.
 - One user's failure (suspended, not found, protected, rate-limited, ...)
   never stops the rest of the batch.
+- A category-intelligence pipeline (LLM-driven account discovery → ranking
+  → tweet collection → trending-topic/sentiment analysis) exposed through a
+  polished "X Intelligence" Streamlit dashboard for journalists/researchers
+  — see "Streamlit UI — X Intelligence" below.
+- "Ask Intelligence": retrieval-augmented Q&A over previously collected
+  posts, with real evidence citations and an explicit "insufficient
+  evidence" fallback rather than fabricated answers.
+- Same-category-across-two-dates comparison and journalist-facing "Story
+  Opportunities" with evidence-backed, AI-assisted brief generation.
 
 ---
 
@@ -45,35 +54,62 @@ use this tool.
 x-profile-scraper/
 │
 ├── app/
-│   ├── client.py       # Twikit session management + Twikit User -> UserProfile mapping
-│   ├── scraper.py       # Concurrency, retry orchestration, progress bar, logging
-│   ├── models.py        # Pydantic UserProfile / ScrapeResult
-│   ├── exporter.py       # JSON/CSV exporters behind a BaseExporter interface
-│   ├── cache.py         # TTL file cache keyed by username
-│   ├── config.py         # pydantic-settings driven configuration
-│   ├── logger.py         # loguru console + rotating file sinks
-│   ├── exceptions.py     # Typed exception hierarchy
-│   └── utils.py         # Username parsing/validation, retry/backoff helper
+│   ├── client.py            # Twikit session management + Twikit User -> UserProfile mapping
+│   ├── scraper.py            # Profile: concurrency, retry orchestration, progress bar, logging
+│   ├── tweet_scraper.py      # Tweets: same pattern, its own (lower) concurrency tier
+│   ├── models.py             # Pydantic UserProfile / Tweet / ScrapeResult
+│   ├── schemas.py            # CategoryContext / RankedAccount / CategoryReport (derived output)
+│   ├── exporter.py           # JSON/CSV exporters behind a BaseExporter interface
+│   ├── cache.py              # TTL file caches (profiles, tweets)
+│   ├── config.py             # pydantic-settings driven configuration
+│   ├── logger.py             # loguru console + rotating file sinks
+│   ├── exceptions.py         # Typed exception hierarchy
+│   ├── utils.py              # Username parsing/validation, retry/backoff helper
+│   ├── llm.py                # Provider-agnostic Groq/Gemini LLM client
+│   ├── category_agent.py     # CategoryAgent + CategoryIntelligenceAgent (pipeline orchestrator)
+│   ├── account_discovery.py  # LLM-only candidate account discovery
+│   ├── account_ranker.py     # Deterministic weighted account ranking
+│   ├── analysis.py           # Trending topics / sentiment / summary (LLM + fallback)
+│   ├── storage.py            # Persists a category run's snapshot + exports
+│   ├── signal_score.py       # Signal Score / Confidence - pure functions over real fields
+│   ├── topic_matching.py     # Keyword-overlap topic<->tweet matching (shared by app/ and ui/)
+│   ├── report_compare.py     # Diff two dated runs of the same category
+│   ├── story_opportunities.py # Derives journalist-facing "worth investigating" signals
+│   ├── story_brief.py        # Generates an evidence-backed brief for one opportunity
+│   └── rag/                  # Ask Intelligence (RAG) - see "Ask Intelligence (RAG)" below
+│       ├── embeddings.py      # sentence-transformers wrapper, lazily imported
+│       ├── vector_store.py    # ChromaDB persistent-collection wrapper
+│       ├── indexer.py         # Tweet -> normalized text + metadata -> upsert; backfill
+│       ├── retriever.py       # question -> embed -> query -> similarity-filtered evidence
+│       ├── reranker.py        # Swappable similarity+recency+engagement reranking heuristic
+│       └── agent.py           # ask_intelligence() + shared citation-resolution helper
 │
 ├── data/
 │   ├── json/            # Timestamped JSON exports (sample_profiles.json checked in)
-│   ├── csv/             # Running users.csv (sample_users.csv checked in)
-│   └── logs/            # Daily rotating log files
+│   ├── csv/             # Running users.csv + per-category tweet CSVs
+│   ├── logs/            # Daily rotating log files
+│   └── tweets/          # data/tweets/<category>/<date>.json run snapshots
+│
+├── .chroma/               # Ask Intelligence vector store (gitignored, derived/regenerable)
 │
 ├── ui/                    # Streamlit presentation layer (see "Streamlit UI" below)
-│   ├── pipeline_runner.py # Calls the existing CategoryIntelligenceAgent - no reimplementation
-│   ├── data_loader.py     # Read-only access to existing data/tweets, data/csv
-│   ├── charts.py          # Plotly chart builders
-│   ├── components.py      # Reusable st.* render functions
-│   ├── styles.py          # Theme-neutral CSS
-│   └── utils.py           # Formatting/validation helpers
+│   ├── pages/              # One module per nav destination (overview/new_analysis/sources/...)
+│   ├── ask_runner.py       # Sync bridge to the async Ask Intelligence / Story Brief flows
+│   ├── pipeline_runner.py  # Calls the existing CategoryIntelligenceAgent - no reimplementation
+│   ├── data_loader.py      # Read-only access to existing data/tweets, data/csv
+│   ├── charts.py           # Plotly chart builders
+│   ├── cards.py            # Signal/source/evidence/freshness/story-opportunity/brief cards
+│   ├── components.py       # Other reusable st.* render functions
+│   ├── styles.py           # Theme-neutral CSS + design tokens
+│   └── utils.py            # Formatting/validation/depth-preset/freshness helpers
 │
 ├── scripts/
-│   └── generate_sample_output.py  # Regenerates the checked-in sample fixtures
+│   ├── generate_sample_output.py  # Regenerates the checked-in sample fixtures
+│   └── backfill_rag_index.py      # Indexes every existing run snapshot for Ask Intelligence
 │
-├── tests/                # pytest unit tests for exporter/models/utils/parsing/ui
+├── tests/                # pytest unit tests, one file per module above (no live credentials)
 ├── main.py               # Typer CLI entry point
-├── streamlit_app.py       # Streamlit UI entry point (streamlit run streamlit_app.py)
+├── streamlit_app.py       # Streamlit UI entry point (streamlit run streamlit_app.py) - thin router
 ├── .env.example
 ├── requirements.txt
 ├── pyproject.toml
@@ -81,9 +117,12 @@ x-profile-scraper/
 ```
 
 Each module has one responsibility and depends only on the layers below it
-(`client`/`cache` -> `scraper` -> `main`), so any piece can be swapped or
-tested independently — e.g. `exporter.py` doesn't know Twikit exists, and
-`models.py`/`utils.py` have zero I/O.
+(`client`/`cache` -> `scraper` -> `category_agent` -> `main`/`ui`), so any
+piece can be swapped or tested independently — e.g. `exporter.py` doesn't
+know Twikit exists, `models.py`/`utils.py`/`signal_score.py`/
+`topic_matching.py`/`report_compare.py` have zero I/O, and `app/` never
+depends on `ui/` (the reverse is fine, and is how `ui/utils.py` re-exports
+`app/topic_matching.py`'s functions for existing call sites).
 
 ---
 
@@ -215,12 +254,15 @@ python main.py analyze technology --candidate-limit 50 --top-accounts 20 --tweet
 
 ---
 
-## Streamlit UI
+## Streamlit UI — X Intelligence
 
-A visual dashboard is available as a second interface over the same backend
-pipeline - it's purely presentational and reuses `CategoryIntelligenceAgent`
-exactly as the CLI does; nothing about discovery, validation, ranking,
-scraping, retry/rate-limit handling, or storage is reimplemented.
+A visual dashboard ("X Intelligence") is available as a second interface
+over the same backend pipeline - it's purely presentational and reuses
+`CategoryIntelligenceAgent` exactly as the CLI does; nothing about
+discovery, validation, ranking, scraping, retry/rate-limit handling, or
+storage is reimplemented. Its page-render code lives in `ui/pages/*.py`,
+one module per nav destination, with `streamlit_app.py` staying a thin
+router (sidebar → page dict → call).
 
 Install the extra dependencies (already included in `requirements.txt`; if
 installing via `pyproject.toml` extras, use `pip install -e ".[ui]"`), then:
@@ -231,31 +273,113 @@ streamlit run streamlit_app.py
 
 Pages (navigate via the sidebar):
 
-- **Dashboard** — landing page; shows the current report's headline stats,
-  top accounts, sentiment, trending topics, and AI summary once one exists.
-- **Analyze Category** — enter a category and candidate limit / top accounts /
-  tweets-per-account, then run the pipeline. Progress is reported per stage
-  (Category Context → Account Discovery → Profile Validation → Account
-  Ranking → Tweet Collection → AI Analysis → Export) as the backend actually
-  completes each one - not simulated.
-- **Accounts** — the ranked account table, plus a per-account detail view
-  including its LLM discovery reason.
-- **Tweets** — browse/search collected tweets by account and free-text.
-- **Analytics** — Plotly charts: ranking score, followers (log scale),
-  relevance vs. score, sentiment, engagement by account, tweet distribution.
-- **Run History** — every previously saved `data/tweets/<category>/<date>.json`
-  run, browsable without making any new X requests.
-- **Settings** — the active configuration (LLM provider/model, concurrency,
-  retry/rate-limit backoff, cache) - credentials are only ever shown as
-  "Configured"/"Not configured", never as values.
-- **Downloads** — the real on-disk run JSON and consolidated/users CSVs.
+- **Overview** — landing page; an onboarding screen with category
+  quick-picks when no analysis has run yet, otherwise an Executive Summary,
+  Key Signals, Top Sources, and Sentiment at a glance.
+- **New Analysis** — pick a category (quick-pick chips or custom text) and
+  an analysis depth ("Standard"/"Deep" - resolves to the underlying
+  candidate-limit/top-accounts/tweets-per-account numbers; power users can
+  still override them in the "Advanced" expander), then click "Analyze
+  Now". Progress is reported per stage (Category Context → Account
+  Discovery → Profile Validation → Account Ranking → Tweet Collection → AI
+  Analysis → Export) via `CategoryIntelligenceAgent.run_pipeline`'s
+  `on_stage` callback as the backend actually completes each one - not
+  simulated.
+- **Sources** — the ranked account table, plus a per-account detail card
+  with relevance/engagement/activity sub-scores, follower count, its LLM
+  discovery reason ("why this source matters"), and a link to the profile.
+- **Intelligence** — two tabs:
+  - *Browse Evidence* — collected tweets grouped by trending topic
+    (keyword-overlap matching against `analysis.trending_topics` - an
+    honest heuristic, not a classifier), with account/topic/search filters.
+  - *Ask Intelligence* — retrieval-augmented Q&A over this category's
+    previously collected posts. See "Ask Intelligence (RAG)" below.
+- **Trends** — the same Plotly charts (ranking score, followers, relevance
+  vs. score, sentiment, engagement, tweet distribution), grouped under
+  business-question subheaders.
+- **Reports** — three tabs:
+  - *All Runs* — every previously saved
+    `data/tweets/<category>/<date>.json` run, browsable without making any
+    new X requests.
+  - *Compare* — compare the SAME category across two different dates
+    (e.g. Technology yesterday vs. today) - tweet/account-count deltas,
+    sentiment shift, topics added/removed/persisted, and the biggest
+    account rank/score movers. See the storage-granularity note below.
+  - *Story Opportunities* — signals from the loaded report that clear a
+    confidence bar, each with a "Generate Brief" action producing an
+    evidence-backed brief (headline, why it matters, observed facts vs. AI
+    interpretation kept in visually distinct sections, supporting
+    posts/accounts, investigation questions).
+- **Settings** — the active configuration, split into "Account & Status"
+  (credentials/LLM - shown only as "Configured"/"Not configured", never as
+  values) and a collapsed "Developer" section (concurrency, retry/rate-limit
+  backoff, cache).
 
-Only the "Run Analysis" button on the Analyze Category page ever triggers a
-pipeline run; every other page reads from the current session's report or
-from disk, so simply browsing the dashboard never makes X/LLM requests.
+Only the "Analyze Now" button on New Analysis ever triggers a live pipeline
+run; every other page reads from the current session's report or from disk,
+so simply browsing never makes an X/LLM request on its own (Ask
+Intelligence/Story Brief generation do call the LLM, but only over already-
+collected, already-indexed posts - never a new X scrape).
 
 Both interfaces (`main.py` and `streamlit_app.py`) share the same `.env`
 configuration and the same `data/` output.
+
+### Ask Intelligence (RAG)
+
+"Ask Intelligence" is retrieval-augmented Q&A over previously collected X
+posts - memory/search over what's already been scraped, not a live web
+search:
+
+```
+X Posts -> Clean/Normalize -> Embeddings -> Vector Store -> Retriever
+-> Relevant X Posts -> Groq -> Evidence-backed Answer
+```
+
+- **Embeddings**: local `sentence-transformers` model (`all-MiniLM-L6-v2`,
+  384-dim, ~80MB) - chosen over a hosted embeddings API specifically to
+  avoid a new required API key/secret; chosen over a larger local model
+  since it's fast on CPU and well-suited to short, informal tweet text.
+  Lazily imported (same pattern as `app/llm.py`'s provider clients), so
+  nothing outside `app/rag/*` pays the import/model-load cost.
+- **Vector store**: ChromaDB, persisted to `.chroma/` (configurable via
+  `CHROMA_DIR`) - one shared collection across all categories, with
+  `category` as a filterable metadata field (simpler and more flexible
+  than per-category collections). The collection is explicitly configured
+  for cosine distance at creation time (`metadata={"hnsw:space": "cosine"}`)
+  so retrieved-evidence similarity scores are meaningful regardless of the
+  embedder's output scale.
+- **Reranking**: a cheap deterministic heuristic (`0.7*similarity +
+  0.2*recency + 0.1*engagement`), not a second model - avoids doubling
+  cold-start latency/install surface for an explicitly optional feature.
+- **Insufficient evidence**: if nothing clears `RAG_MIN_SIMILARITY` (default
+  `0.30`, needs empirical tuning against your own data), Ask Intelligence
+  says so explicitly and makes zero LLM calls, rather than guessing.
+
+Install the extra dependencies (`pip install -e ".[rag]"`, or they're
+already listed in `requirements.txt`) - the `sentence-transformers` model
+weights and the CPU `torch` wheel download on first real use, not at
+install time (expect ~500MB-1GB on first run).
+
+Before asking questions, index the posts you've already collected:
+
+```bash
+python scripts/backfill_rag_index.py
+```
+
+This walks every existing `data/tweets/<category>/<date>.json` snapshot and
+indexes it (idempotent - safe to re-run any time; re-indexing the same
+tweet overwrites rather than duplicates it). The Ask Intelligence tab also
+has a "Build / Refresh Index" button that does the same thing.
+
+### Compare's storage granularity
+
+Compare's two-run diff reuses the existing one-file-per-category-per-day
+snapshot layout (`data/tweets/<category>/<date>.json`) unchanged - this is
+a deliberate choice, not an oversight. Compare's real use case is "what
+changed since a previous date," which the existing per-day granularity
+already serves; adding intra-day run versioning would be scope creep that
+also risks breaking `load_latest_category_run()`'s "sorted, take last"
+assumption, for no benefit to this feature.
 
 ---
 
@@ -337,10 +461,17 @@ to `data/logs/scraper_YYYY-MM-DD.log`.
 pytest -q
 ```
 
-Covers `app/exporter.py`, `app/models.py`, `app/utils.py`, `app/cache.py`,
-and the Twikit-response-to-`UserProfile` parsing logic in `app/client.py`
-(via a fake `SimpleNamespace` user object, so no network/credentials are
-needed to run the suite).
+268 tests, all fully offline - no network, no X/LLM credentials, and no
+real embedding model load (RAG tests use a small deterministic stub
+embedder plus a real tmp_path-backed Chroma store). Covers the scraping
+core (`app/exporter.py`, `app/models.py`, `app/utils.py`, `app/cache.py`,
+the Twikit-response-to-`UserProfile` parsing logic in `app/client.py` via a
+fake `SimpleNamespace` user object), the category-intelligence pipeline
+(`app/category_agent.py`, `app/account_ranker.py`, `app/account_discovery.py`,
+`app/analysis.py`, `app/storage.py`), and everything added by this
+transformation - signal scoring/confidence, topic matching, report
+comparison, story opportunities/briefs, and the full RAG stack
+(`app/rag/*`, `ui/ask_runner.py`).
 
 Lint/format:
 
@@ -381,9 +512,14 @@ isort .
 - **A specific username always fails.** Check the log line's exception type
   — `UserNotFoundError`/`AccountSuspendedError`/`ProtectedAccountError` mean
   the account genuinely can't be read; that's expected, not a bug.
-- **`ModuleNotFoundError: No module named 'app'`** when running scripts
-  directly. Run from the project root (`x-profile-scraper/`) so `app/` is
-  importable, or run via `python main.py ...` which already does this.
+- **`ModuleNotFoundError: No module named 'app'`** when running a script
+  under `scripts/` directly (e.g. `python scripts/backfill_rag_index.py`).
+  Python puts the script's own directory on `sys.path`, not the project
+  root, so `app`/`ui` aren't importable even when your shell's current
+  directory is `x-profile-scraper/`. Either install the project in editable
+  mode once (`pip install -e .`) or prefix the command with `PYTHONPATH=.`
+  (`PYTHONPATH=. python scripts/backfill_rag_index.py`). `python main.py ...`
+  is unaffected - it's the top-level entry point, already on the right path.
 
 ---
 
@@ -392,13 +528,21 @@ isort .
 The architecture leaves room for, without requiring changes to existing
 modules:
 
-- Recent public posts collection, engagement analytics, sentiment analysis
-  (new methods on `TwikitProfileClient` + new fields/models).
 - Followers/following analysis, subject to platform capabilities and ToS.
 - Additional storage backends — implement `BaseExporter` in `exporter.py`
-  for SQLite/PostgreSQL/MongoDB and register it with `ExporterRegistry`.
-- A FastAPI service or Streamlit dashboard wrapping `ProfileScraper`.
-- A scheduler (cron/APScheduler) invoking `main.py` periodically.
+  for SQLite/PostgreSQL/MongoDB and register it with `ExporterRegistry`
+  (the vector store's Chroma metadata could also move to whichever backend
+  is chosen, though the flat-file snapshot format `app/rag/indexer.py`
+  reads from would stay unchanged).
+- A model-based reranker (e.g. a cross-encoder) as a drop-in replacement
+  for `app/rag/reranker.py`'s current heuristic - the interface
+  (`rerank(chunks, top_n) -> chunks`) is already swappable.
+- A FastAPI service exposing `CategoryIntelligenceAgent`/Ask Intelligence
+  programmatically, for integrations beyond the Streamlit UI.
+- A scheduler (cron/APScheduler) invoking `main.py analyze <category>`
+  periodically, so Compare/Story Opportunities always have a fresh
+  same-category, different-date pair to work with.
 - Docker packaging.
-- AI-powered profile summarization as a post-processing step over
-  `UserProfile` records.
+- Per-tweet topic labels (from a real classifier, not the current
+  keyword-overlap heuristic in `app/topic_matching.py`) for more precise
+  evidence grouping and story-opportunity scoring.

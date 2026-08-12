@@ -81,3 +81,14 @@ class LLMError(ScraperError):
     and fall back to deterministic logic (curated seeds, keyword-overlap
     scoring, frequency-based analysis).
     """
+
+
+class RAGError(ScraperError):
+    """Raised when embedding/vector-store operations fail (e.g. chromadb or
+    sentence-transformers not installed, or a query/upsert fails).
+
+    Never fatal to the category-intelligence pipeline - indexing failures
+    are logged and skipped (see `app/storage.py::save_category_run`);
+    retrieval failures degrade to "insufficient evidence" rather than
+    crashing the Ask Intelligence flow.
+    """

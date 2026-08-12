@@ -13,6 +13,17 @@ formula, and the result is 0-100 too:
 `app/llm.py`) or by the deterministic keyword-overlap heuristic here - either
 way it arrives as a plain float before ranking, so the weighted-sum math
 itself never depends on the LLM being available.
+
+Below `RELEVANCE_FLOOR`, engagement/activity/audience are zeroed out of the
+score entirely (see `_combined_score`) - real relevance is the one signal
+that actually says whether an account belongs in this category at all, and
+the other three combined (0.60) outweigh it (0.40) enough that a highly
+engaged but irrelevant account could otherwise still out-rank a genuinely
+relevant one. Known residual limitation: X exposes no verified-identity
+signal, so an LLM-discovered handle that has since been abandoned/reused by
+an unrelated account can still occasionally clear the floor if its bio text
+happens to read as ambiguous rather than clearly off-topic - this reduces,
+but cannot fully eliminate, that class of false positive.
 """
 
 from __future__ import annotations
@@ -28,6 +39,36 @@ from app.utils import dedupe_preserve_order
 
 #: (category_relevance, engagement, activity, audience)
 DEFAULT_WEIGHTS = (0.40, 0.25, 0.20, 0.15)
+
+#: category_relevance's weight (0.40) is the single largest term, but the
+#: other three sum to 0.60 - without a floor, an account with near-zero
+#: real relevance to the category can still out-rank a genuinely relevant
+#: one purely on engagement/activity/audience (e.g. a reused/ambiguous
+#: handle like "@hhs" being suggested for "healthcare" by discovery, but
+#: actually belonging to an unrelated person whose unrelated posts still
+#: get ordinary engagement). Below this floor, only the relevance term
+#: contributes to the score - the weighted formula itself is unchanged
+#: for every account that clears the bar, so this never affects a
+#: genuinely relevant, high-engagement account.
+RELEVANCE_FLOOR = 20.0
+
+
+def _combined_score(
+    relevance: float,
+    engagement: float,
+    activity: float,
+    audience: float,
+    weights: tuple[float, float, float, float],
+) -> float:
+    relevance_w, engagement_w, activity_w, audience_w = weights
+    if relevance < RELEVANCE_FLOOR:
+        return relevance_w * relevance
+    return (
+        relevance_w * relevance
+        + engagement_w * engagement
+        + activity_w * activity
+        + audience_w * audience
+    )
 
 
 def normalize_log(value: float | None, cap: float) -> float:
@@ -110,6 +151,12 @@ async def compute_category_relevance_llm(
         f"Display name: {profile.display_name or ''}\n"
         f"Bio: {profile.bio or ''}\n\n"
         "On a scale of 0-100, how relevant is this account to the category? "
+        "Base your judgment ONLY on the actual display name and bio text above - "
+        "a username can be misleading, outdated, or reused/reassigned to an "
+        "unrelated person or organization, so never infer relevance from the "
+        "username alone. If the display name and bio give no real indication "
+        "the account covers this category, score it low (under 20) even if the "
+        "username itself looks related.\n"
         'Return ONLY JSON: {"relevance": <number>}'
     )
     try:
@@ -145,7 +192,6 @@ def rank_accounts(
 ) -> list[RankedAccount]:
     """Score every profile and return them sorted descending by ranking_score."""
     relevance_scores = relevance_scores or {}
-    relevance_w, engagement_w, activity_w, audience_w = weights
 
     ranked: list[RankedAccount] = []
     for profile in profiles:
@@ -153,12 +199,7 @@ def rank_accounts(
         engagement = compute_engagement_score(profile)
         activity = compute_activity_score(profile)
         audience = compute_audience_score(profile)
-        score = (
-            relevance_w * relevance
-            + engagement_w * engagement
-            + activity_w * activity
-            + audience_w * audience
-        )
+        score = _combined_score(relevance, engagement, activity, audience, weights)
         ranked.append(
             RankedAccount(
                 rank=0,
@@ -191,17 +232,16 @@ def rerank_with_tweet_engagement(
 ) -> list[RankedAccount]:
     """Replace the profile-level engagement proxy with real per-tweet
     engagement for accounts whose tweets were collected, and re-sort."""
-    relevance_w, engagement_w, activity_w, audience_w = weights
-
     updated: list[RankedAccount] = []
     for account in ranked:
         tweets = tweets_by_username.get(account.username)
         engagement = compute_tweet_engagement_score(tweets) if tweets else account.engagement_score
-        score = (
-            relevance_w * account.category_relevance
-            + engagement_w * engagement
-            + activity_w * account.activity_score
-            + audience_w * account.audience_score
+        score = _combined_score(
+            account.category_relevance,
+            engagement,
+            account.activity_score,
+            account.audience_score,
+            weights,
         )
         updated.append(
             account.model_copy(

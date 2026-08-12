@@ -41,6 +41,7 @@ from app.utils import (
     is_valid_username,
     normalize_username,
     read_usernames_from_file,
+    split_errors_by_stage,
 )
 
 
@@ -209,9 +210,16 @@ def _print_category_report(report: CategoryReport, requested_top_n: int) -> None
     )
     if report.analysis.summary:
         console.print(f"\n{report.analysis.summary}")
-    if report.errors:
+    validation_errors, pipeline_errors = split_errors_by_stage(report.errors)
+    if pipeline_errors:
         console.print(
-            f"\n[yellow]{len(report.errors)} error(s) during the run - see the log file for detail.[/yellow]"
+            f"\n[yellow]{len(pipeline_errors)} pipeline failure(s) among the selected accounts - "
+            "see the log file for detail.[/yellow]"
+        )
+    if validation_errors:
+        console.print(
+            f"[dim]{len(validation_errors)} candidate account(s) were rejected during "
+            "discovery/validation before ranking - not part of the final selected accounts.[/dim]"
         )
 
     category_csv_path = settings.csv_output_dir / f"{report.category}_tweets.csv"

@@ -13,6 +13,13 @@ import streamlit as st
 
 _CSS = """
 <style>
+:root {
+    --xi-space-xs: 0.25rem;
+    --xi-space-sm: 0.5rem;
+    --xi-space-md: 1rem;
+    --xi-space-lg: 1.5rem;
+}
+
 section[data-testid="stSidebar"] {
     border-right: 1px solid rgba(127, 127, 127, 0.2);
 }
@@ -68,6 +75,56 @@ div[data-testid="stMetric"] {
 div[data-testid="stExpander"] {
     border: 1px solid rgba(127, 127, 127, 0.15);
     border-radius: 0.5rem;
+}
+
+.xi-card-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    opacity: 0.65;
+    margin-bottom: var(--xi-space-xs);
+}
+
+/* Signal-strength badges - same rgba language as the status dots above,
+   just a filled pill instead of a bare dot, plus a neutral/amber variant
+   for "medium" states that the two-color status convention didn't need. */
+.xi-signal-badge {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 0.15rem 0.6rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+.xi-signal-badge-high { background-color: rgba(84, 162, 75, 0.15); color: #54A24B; }
+.xi-signal-badge-medium { background-color: rgba(224, 158, 24, 0.15); color: #B87F0F; }
+.xi-signal-badge-low { background-color: rgba(127, 127, 127, 0.15); color: #7A7A7A; }
+
+.xi-status-warn { background-color: #E09E18; }
+
+.xi-evidence-quote {
+    border-left: 3px solid rgba(76, 120, 168, 0.5);
+    padding: var(--xi-space-xs) var(--xi-space-md);
+    margin: var(--xi-space-xs) 0;
+    font-style: italic;
+    opacity: 0.9;
+}
+
+.xi-confidence-meter {
+    position: relative;
+    height: 6px;
+    border-radius: 999px;
+    background-color: rgba(127, 127, 127, 0.15);
+    overflow: hidden;
+    margin: var(--xi-space-xs) 0;
+}
+.xi-confidence-meter-fill {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    border-radius: 999px;
+    background-color: #4C78A8;
 }
 </style>
 """

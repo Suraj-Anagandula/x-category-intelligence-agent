@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pandas as pd
 
 from app.config import Settings
 from app.models import Tweet, UserProfile
-from app.schemas import CategoryAnalysis, CategoryReport, RankedAccount, TweetStatistics
+from app.schemas import (
+    CategoryAnalysis,
+    CategoryReport,
+    RankedAccount,
+    TimeWindowInfo,
+    TweetStatistics,
+)
 from app.storage import load_latest_category_run, save_category_run
+from app.time_window import resolve_time_window
 
 
 def _settings(tmp_path) -> Settings:
@@ -134,6 +142,91 @@ async def test_save_category_run_handles_no_profiles_or_tweets(tmp_path) -> None
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["accounts"] == []
     assert payload["tweets"] == []
+
+
+async def test_save_category_run_writes_time_window_metadata(tmp_path) -> None:
+    """Section 8: every snapshot must record the analysis window (mode,
+    start/end, fetched/in-window counts) - distinct from `scraped_at`,
+    which stays the collection/run timestamp."""
+    settings = _settings(tmp_path)
+    window = resolve_time_window("7d")
+    report = CategoryReport(
+        category="sports",
+        time_window=TimeWindowInfo(
+            mode="7d", start=window.start, end=window.end, posts_fetched=250, posts_in_window=143
+        ),
+    )
+
+    path = await save_category_run("sports", report, [], [], settings)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["time_window"]["mode"] == "7d"
+    assert payload["time_window"]["posts_fetched"] == 250
+    assert payload["time_window"]["posts_in_window"] == 143
+    # Python 3.10's datetime.fromisoformat() doesn't accept a trailing "Z"
+    # (Pydantic's JSON mode uses "Z" for UTC) - normalize before parsing.
+    stored_start = payload["time_window"]["start"].replace("Z", "+00:00")
+    assert datetime.fromisoformat(stored_start) == window.start
+    # scraped_at (run/collection time) stays a separate, independent field.
+    assert "scraped_at" in payload
+    assert payload["scraped_at"] != payload["time_window"]["start"]
+
+
+async def test_save_category_run_defaults_time_window_to_latest(tmp_path) -> None:
+    """A report built without an explicit time_window (every existing
+    caller/test that predates this feature) still writes a well-formed,
+    "latest"-mode time_window block - never a missing/malformed key."""
+    settings = _settings(tmp_path)
+    report = _report()  # no time_window passed - uses TimeWindowInfo()'s default
+
+    path = await save_category_run("sports", report, [], [], settings)
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["time_window"]["mode"] == "latest"
+    assert payload["time_window"]["start"] is None
+    assert payload["time_window"]["posts_fetched"] == 0
+
+
+async def test_save_category_run_survives_index_fn_failure(tmp_path) -> None:
+    """RAG indexing is an optional enhancement (app.rag.indexer.index_tweets,
+    wired in via CategoryIntelligenceAgent's `rag_indexer`) - a failure
+    there must never prevent the scrape run itself from being saved."""
+    settings = _settings(tmp_path)
+    report = _report()
+
+    def _failing_index_fn(tweets, category, scraped_at):
+        raise RuntimeError("vector store unavailable")
+
+    path = await save_category_run(
+        "sports",
+        report,
+        [],
+        [Tweet(id="1", username="espn", text="hello")],
+        settings,
+        index_fn=_failing_index_fn,
+    )
+
+    assert path.exists()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["category"] == "sports"
+
+
+async def test_save_category_run_calls_index_fn_with_real_arguments(tmp_path) -> None:
+    settings = _settings(tmp_path)
+    report = _report()
+    tweets = [Tweet(id="1", username="espn", text="hello")]
+    captured = {}
+
+    def _capturing_index_fn(indexed_tweets, category, scraped_at):
+        captured["tweets"] = indexed_tweets
+        captured["category"] = category
+        captured["scraped_at"] = scraped_at
+
+    await save_category_run("sports", report, [], tweets, settings, index_fn=_capturing_index_fn)
+
+    assert captured["tweets"] == tweets
+    assert captured["category"] == "sports"
+    assert captured["scraped_at"] is not None
 
 
 async def test_load_latest_category_run_returns_none_when_missing(tmp_path) -> None:

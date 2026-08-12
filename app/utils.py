@@ -71,6 +71,26 @@ def read_usernames_from_file(path: Path) -> list[str]:
     return usernames
 
 
+def split_errors_by_stage(errors: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split a `CategoryReport.errors` list into `(validation_errors,
+    pipeline_errors)` by each error's `"stage"` field.
+
+    "validation"-stage errors are candidate accounts rejected during
+    discovery/validation, before ranking/selection ever runs (e.g. a
+    discovered handle that doesn't exist or is protected) - a normal,
+    expected part of dynamic discovery, not a failure of the final
+    selected accounts. `app/category_agent.py`'s `accounts_failed`/
+    `accounts_rate_limited`/`accounts_failed_other` stats already only
+    count "tweets"-stage errors; this split lets callers report the two
+    kinds distinctly instead of conflating them into one "N accounts
+    failed" count. Any non-"validation" stage (currently just "tweets")
+    is treated as a pipeline error, never silently dropped.
+    """
+    validation_errors = [e for e in errors if e.get("stage") == "validation"]
+    pipeline_errors = [e for e in errors if e.get("stage") != "validation"]
+    return validation_errors, pipeline_errors
+
+
 async def retry_with_backoff(
     func: Callable[[], Awaitable[T]],
     *,

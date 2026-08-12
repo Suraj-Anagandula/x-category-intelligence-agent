@@ -85,6 +85,23 @@ class Settings(BaseSettings):
     # aggressively than the profile-lookup endpoint, so the profile
     # scraper's concurrency tier is too aggressive for tweet scraping.
     tweet_scrape_concurrency: int = Field(default=3, alias="TWEET_SCRAPE_CONCURRENCY")
+    # Only consulted when a real (non-"latest") time window is selected -
+    # see app/client.py::TwikitProfileClient.get_recent_tweets. Bounds how
+    # many cursor-paginated pages of tweets are fetched per account while
+    # trying to reach the requested window's start date, so a custom range
+    # far in an account's past can't trigger unbounded requests.
+    tweet_window_max_pages: int = Field(default=10, alias="TWEET_WINDOW_MAX_PAGES")
+
+    # --- Ask Intelligence (RAG) ---
+    # Only touched by app/rag/* (lazily imported - chromadb/sentence-transformers
+    # are an optional extra, see pyproject.toml's `rag` group). A vector index is
+    # derived/regenerable from data/tweets/*, so its directory lives alongside
+    # .cache/ rather than data/ and is gitignored.
+    chroma_dir: Path = Field(default=Path(".chroma"), alias="CHROMA_DIR")
+    #: Minimum similarity (1 - cosine distance) for a retrieved chunk to count
+    #: as evidence at all - needs empirical tuning against real indexed data,
+    #: hence a config knob rather than a hardcoded constant.
+    rag_min_similarity: float = Field(default=0.30, alias="RAG_MIN_SIMILARITY")
 
     @field_validator("concurrency_limit")
     @classmethod
@@ -106,6 +123,7 @@ class Settings(BaseSettings):
             self.x_session_file.parent,
             self.tweets_output_dir,
             self.tweet_cache_dir,
+            self.chroma_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
 

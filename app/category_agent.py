@@ -17,6 +17,7 @@ swapped in later without touching the other modules.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 from app.account_discovery import discover_candidates
 from app.account_ranker import (
@@ -31,9 +32,10 @@ from app.exceptions import LLMError
 from app.llm import LLMProvider
 from app.logger import get_logger
 from app.models import Tweet
-from app.schemas import CategoryContext, CategoryReport, TweetStatistics
+from app.schemas import CategoryContext, CategoryReport, TimeWindowInfo, TweetStatistics
 from app.scraper import ProfileScraper
 from app.storage import save_category_run
+from app.time_window import TimeWindow, filter_tweets_to_window, resolve_time_window
 from app.tweet_scraper import TweetScraper
 
 logger = get_logger()
@@ -162,12 +164,19 @@ class CategoryIntelligenceAgent:
         profile_scraper: ProfileScraper,
         tweet_scraper: TweetScraper,
         llm_client: LLMProvider | None = None,
+        rag_indexer: Callable[[list[Tweet], str, object], int] | None = None,
     ) -> None:
         self.settings = settings
         self.profile_scraper = profile_scraper
         self.tweet_scraper = tweet_scraper
         self.llm_client = llm_client
         self.category_agent = CategoryAgent(llm_client)
+        #: Optional `(tweets, category, scraped_at) -> count_indexed`
+        #: callable - see `app.rag.indexer.index_tweets` for the real
+        #: implementation. `None` (the default) means Ask Intelligence
+        #: indexing is skipped entirely; every existing caller that
+        #: constructs this class without it keeps working unmodified.
+        self.rag_indexer = rag_indexer
 
     async def run_pipeline(
         self,
@@ -175,11 +184,22 @@ class CategoryIntelligenceAgent:
         candidate_limit: int | None = None,
         top_n: int | None = None,
         tweets_per_account: int | None = None,
+        *,
+        on_stage: Callable[[str, dict], None] | None = None,
+        time_window: TimeWindow | None = None,
     ) -> CategoryReport:
         candidate_limit = candidate_limit or self.settings.category_candidate_limit
         top_n = top_n or self.settings.top_accounts_limit
         tweets_per_account = tweets_per_account or self.settings.tweets_per_account
+        #: Defaults to "latest" (no filtering) - every existing caller that
+        #: doesn't pass `time_window` keeps the original "most recent
+        #: available tweets" behavior unchanged.
+        time_window = time_window or resolve_time_window("latest")
         errors: list[dict[str, str]] = []
+
+        def _emit(stage_key: str, payload: dict) -> None:
+            if on_stage is not None:
+                on_stage(stage_key, payload)
 
         normalized = normalize_category(category)
         logger.info(f"Category: {normalized}")
@@ -190,6 +210,10 @@ class CategoryIntelligenceAgent:
             f"Category context for {normalized!r}: {len(ctx.keywords)} keyword(s), "
             f"{len(ctx.subcategories)} subcategory(ies)"
         )
+        _emit(
+            "context",
+            {"keywords": len(ctx.keywords), "subcategories": len(ctx.subcategories)},
+        )
 
         logger.info(f"Dynamic discovery started for {normalized!r}")
         discovered = await discover_candidates(
@@ -198,6 +222,7 @@ class CategoryIntelligenceAgent:
         candidates = [account.username for account in discovered]
         discovery_reasons = {account.username: account.reason for account in discovered}
         logger.info(f"Candidates discovered: {len(candidates)} (requested up to {candidate_limit})")
+        _emit("discovery", {"candidates_discovered": len(candidates)})
 
         logger.info("Profile validation started")
         scrape_results = await self.profile_scraper.scrape_many(candidates)
@@ -213,6 +238,10 @@ class CategoryIntelligenceAgent:
                     }
                 )
         logger.info(f"Profiles validated: {len(valid_profiles)}/{len(scrape_results)}")
+        _emit(
+            "validation",
+            {"profiles_validated": len(valid_profiles), "profiles_attempted": len(scrape_results)},
+        )
 
         relevance_scores: dict[str, float] = {}
         if self.llm_client is not None:
@@ -225,14 +254,16 @@ class CategoryIntelligenceAgent:
         ranked = rank_accounts(valid_profiles, ctx, relevance_scores)
         top_accounts = select_top_n(ranked, top_n)
         logger.info(f"Accounts selected: {len(top_accounts)}/{top_n}")
+        _emit("ranking", {"accounts_selected": len(top_accounts), "top_n_requested": top_n})
 
         top_usernames = [account.username for account in top_accounts]
         logger.info(
             f"Starting tweet scraping: {len(top_usernames)} account(s), "
             f"{tweets_per_account} tweet(s)/account"
+            + (f", time window={time_window.mode}" if time_window.is_filtered else "")
         )
         tweet_results = await self.tweet_scraper.scrape_many(
-            top_usernames, count=tweets_per_account
+            top_usernames, count=tweets_per_account, window=time_window
         )
 
         all_tweets: list[Tweet] = []
@@ -256,7 +287,31 @@ class CategoryIntelligenceAgent:
                     }
                 )
 
+        # Apply the actual created_at time-window filter here, once, before
+        # anything downstream (ranking, analysis, storage, RAG indexing)
+        # ever sees the tweets - "latest" mode is a no-op (returns the same
+        # tweets), so this line changes nothing when no window was selected.
+        posts_fetched = len(all_tweets)
+        if time_window.is_filtered:
+            all_tweets = filter_tweets_to_window(all_tweets, time_window)
+            tweets_by_username = {
+                username: filter_tweets_to_window(tweets, time_window)
+                for username, tweets in tweets_by_username.items()
+            }
+        posts_in_window = len(all_tweets)
+        if time_window.is_filtered:
+            logger.info(
+                f"Time window {time_window.mode!r}: {posts_in_window}/{posts_fetched} "
+                "fetched post(s) fell inside the requested range"
+            )
+
         top_accounts = rerank_with_tweet_engagement(top_accounts, tweets_by_username)
+        top_accounts = [
+            account.model_copy(
+                update={"discovery_reason": discovery_reasons.get(account.username, "")}
+            )
+            for account in top_accounts
+        ]
 
         stats = TweetStatistics(
             accounts_processed=len(top_accounts) - accounts_failed,
@@ -273,10 +328,21 @@ class CategoryIntelligenceAgent:
             f"  Accounts failed for other reasons: {stats.accounts_failed_other}\n"
             f"  Tweets collected: {stats.tweets_collected}"
         )
+        _emit(
+            "tweets",
+            {
+                "tweets_collected": stats.tweets_collected,
+                "accounts_failed": accounts_failed,
+                "accounts_rate_limited": accounts_rate_limited,
+                "posts_fetched": posts_fetched,
+                "posts_in_window": posts_in_window,
+            },
+        )
 
         logger.info(f"Analysis started for {normalized!r}")
         analysis = await analyze_category(normalized, all_tweets, self.llm_client)
         logger.info("Analysis completed")
+        _emit("analysis", {"trending_topics": len(analysis.trending_topics)})
 
         report = CategoryReport(
             category=normalized,
@@ -284,6 +350,13 @@ class CategoryIntelligenceAgent:
             tweet_statistics=stats,
             analysis=analysis,
             errors=errors,
+            time_window=TimeWindowInfo(
+                mode=time_window.mode,
+                start=time_window.start,
+                end=time_window.end,
+                posts_fetched=posts_fetched,
+                posts_in_window=posts_in_window,
+            ),
         )
 
         top_username_set = set(top_usernames)
@@ -291,10 +364,17 @@ class CategoryIntelligenceAgent:
             profile for profile in valid_profiles if profile.username in top_username_set
         ]
         await save_category_run(
-            normalized, report, top_profiles, all_tweets, self.settings, discovery_reasons
+            normalized,
+            report,
+            top_profiles,
+            all_tweets,
+            self.settings,
+            discovery_reasons,
+            index_fn=self.rag_indexer,
         )
 
         category_csv_path = self.settings.csv_output_dir / f"{normalized}_tweets.csv"
         logger.info(f"CSV: {category_csv_path}")
+        _emit("export", {"csv_path": str(category_csv_path)})
 
         return report

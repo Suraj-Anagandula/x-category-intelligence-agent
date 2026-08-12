@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app.client import TwikitProfileClient, _map_twikit_exception, _parse_created_at
+from app.time_window import resolve_time_window
 
 
 def test_parse_created_at_legacy_twitter_format() -> None:
@@ -180,6 +182,187 @@ async def test_get_recent_tweets_trims_to_requested_count() -> None:
     tweets = await client.get_recent_tweets("elonmusk", count=5)
 
     assert len(tweets) == 5
+
+
+def _legacy_format(dt: datetime) -> str:
+    """The exact legacy X timestamp format `_parse_created_at` expects."""
+    return dt.strftime("%a %b %d %H:%M:%S +0000 %Y")
+
+
+class _StubPage:
+    """Stands in for twikit's `Result[Tweet]` - supports iteration and an
+    async `.next()` returning the next page in a pre-built chain (mirrors
+    the real `Result.next()`/cursor pagination confirmed in twikit's source)."""
+
+    def __init__(self, tweets: list, next_page: _StubPage | None = None) -> None:
+        self._tweets = tweets
+        self._next_page = next_page
+        self.next_calls = 0
+
+    def __iter__(self):
+        return iter(self._tweets)
+
+    async def next(self) -> _StubPage:
+        self.next_calls += 1
+        return self._next_page if self._next_page is not None else _StubPage([])
+
+
+class _StubPaginatingRawClient:
+    """Like `_StubRawClient`, but `get_user_tweets` returns a `_StubPage`
+    supporting real cursor pagination via `.next()`."""
+
+    def __init__(self, first_page: _StubPage) -> None:
+        self._first_page = first_page
+        self.get_user_tweets_calls = 0
+
+    async def get_user_by_screen_name(self, username: str):
+        return SimpleNamespace(id="1", screen_name=username)
+
+    async def get_user_tweets(self, user_id: str, tweet_type: str, count: int):
+        self.get_user_tweets_calls += 1
+        return self._first_page
+
+
+def _window(start_days_ago: int, end_days_ago: int = 0):
+    now = datetime.now(timezone.utc)
+    return resolve_time_window(
+        "custom",
+        custom_start=now - timedelta(days=start_days_ago),
+        custom_end=now - timedelta(days=end_days_ago) if end_days_ago else now,
+    )
+
+
+async def test_get_recent_tweets_without_window_never_paginates() -> None:
+    """Preserves the original single-page behavior exactly - `.next()`
+    must never be called when no window is given."""
+    page1 = _StubPage(
+        [_fake_tweet(id=1, created_at=_legacy_format(datetime.now(timezone.utc)))],
+        next_page=_StubPage([_fake_tweet(id=2)]),
+    )
+    client = TwikitProfileClient(session_file=None)
+    client._client = _StubPaginatingRawClient(page1)
+
+    tweets = await client.get_recent_tweets("elonmusk", count=10, window=None)
+
+    assert [t.id for t in tweets] == ["1"]
+    assert page1.next_calls == 0
+
+
+async def test_get_recent_tweets_paginates_when_first_page_insufficient() -> None:
+    """Pagination continues when the first page doesn't reach far enough
+    back to cover the requested window's start."""
+    now = datetime.now(timezone.utc)
+    window = _window(start_days_ago=5)
+
+    page3 = _StubPage([_fake_tweet(id=3, created_at=_legacy_format(now - timedelta(days=6)))])
+    page2 = _StubPage(
+        [_fake_tweet(id=2, created_at=_legacy_format(now - timedelta(days=2)))], next_page=page3
+    )
+    page1 = _StubPage(
+        [_fake_tweet(id=1, created_at=_legacy_format(now - timedelta(hours=1)))], next_page=page2
+    )
+
+    client = TwikitProfileClient(session_file=None)
+    client._client = _StubPaginatingRawClient(page1)
+
+    tweets = await client.get_recent_tweets("elonmusk", count=10, window=window, max_pages=10)
+
+    assert {t.id for t in tweets} == {"1", "2", "3"}
+
+
+async def test_get_recent_tweets_stops_pagination_once_older_than_start() -> None:
+    """Once a fetched page's oldest tweet is already older than the
+    window's start, pagination must stop - a further page must never be
+    requested."""
+    now = datetime.now(timezone.utc)
+    window = _window(start_days_ago=5)
+
+    # page2's tweet is already older than window.start (5 days ago) -
+    # page3 must never be fetched.
+    page3 = _StubPage([_fake_tweet(id=99, created_at=_legacy_format(now - timedelta(days=20)))])
+    page2 = _StubPage(
+        [_fake_tweet(id=2, created_at=_legacy_format(now - timedelta(days=6)))], next_page=page3
+    )
+    page1 = _StubPage(
+        [_fake_tweet(id=1, created_at=_legacy_format(now - timedelta(hours=1)))], next_page=page2
+    )
+
+    client = TwikitProfileClient(session_file=None)
+    client._client = _StubPaginatingRawClient(page1)
+
+    tweets = await client.get_recent_tweets("elonmusk", count=10, window=window, max_pages=10)
+
+    assert {t.id for t in tweets} == {"1", "2"}
+    assert page2.next_calls == 0  # page3 was never requested
+
+
+async def test_get_recent_tweets_stops_when_x_has_no_more_tweets() -> None:
+    """An empty page (no `fetch_next_result`/cursor) means X has nothing
+    more to give - must stop cleanly, not crash."""
+    now = datetime.now(timezone.utc)
+    window = _window(start_days_ago=30)
+
+    page2 = _StubPage([])  # X has no more tweets
+    page1 = _StubPage(
+        [_fake_tweet(id=1, created_at=_legacy_format(now - timedelta(hours=1)))], next_page=page2
+    )
+
+    client = TwikitProfileClient(session_file=None)
+    client._client = _StubPaginatingRawClient(page1)
+
+    tweets = await client.get_recent_tweets("elonmusk", count=10, window=window, max_pages=10)
+
+    assert {t.id for t in tweets} == {"1"}
+
+
+async def test_get_recent_tweets_respects_max_pages_safety_cap() -> None:
+    """A safety bound on pagination depth - must not fetch indefinitely
+    even if every page still looks "within range"."""
+    now = datetime.now(timezone.utc)
+    window = _window(start_days_ago=365)  # far enough back that pages never age out
+
+    # Build a long chain where every page's tweet is recent (never triggers
+    # the "older than start" stop condition) - only max_pages should stop it.
+    chain = _StubPage([_fake_tweet(id=10, created_at=_legacy_format(now - timedelta(hours=1)))])
+    for i in range(9, 0, -1):
+        chain = _StubPage(
+            [_fake_tweet(id=i, created_at=_legacy_format(now - timedelta(hours=1)))],
+            next_page=chain,
+        )
+
+    client = TwikitProfileClient(session_file=None)
+    client._client = _StubPaginatingRawClient(chain)
+
+    tweets = await client.get_recent_tweets("elonmusk", count=10, window=window, max_pages=3)
+
+    # 3 pages fetched (1 initial tweet each) => at most 3 unique tweets.
+    assert len(tweets) <= 3
+
+
+async def test_get_recent_tweets_deduplicates_across_pages() -> None:
+    """The same tweet id appearing on two pages (a realistic X pagination
+    overlap) must not be counted/returned twice."""
+    now = datetime.now(timezone.utc)
+    window = _window(start_days_ago=5)
+
+    page2 = _StubPage(
+        [
+            _fake_tweet(id=1, created_at=_legacy_format(now - timedelta(hours=2))),  # overlap
+            _fake_tweet(id=2, created_at=_legacy_format(now - timedelta(days=6))),
+        ]
+    )
+    page1 = _StubPage(
+        [_fake_tweet(id=1, created_at=_legacy_format(now - timedelta(hours=2)))], next_page=page2
+    )
+
+    client = TwikitProfileClient(session_file=None)
+    client._client = _StubPaginatingRawClient(page1)
+
+    tweets = await client.get_recent_tweets("elonmusk", count=10, window=window, max_pages=10)
+
+    ids = [t.id for t in tweets]
+    assert ids.count("1") == 1
+    assert set(ids) == {"1", "2"}
 
 
 class TooManyRequests(Exception):

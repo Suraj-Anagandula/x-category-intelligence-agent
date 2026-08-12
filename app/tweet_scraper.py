@@ -33,6 +33,7 @@ from app.config import Settings
 from app.exceptions import InvalidUsernameError, ScraperError
 from app.logger import get_logger
 from app.models import TweetScrapeResult
+from app.time_window import TimeWindow, resolve_time_window
 from app.utils import is_valid_username, normalize_username, retry_with_backoff
 
 logger = get_logger()
@@ -47,7 +48,10 @@ class TweetScraper:
         self.cache = cache
         self._semaphore = asyncio.Semaphore(settings.tweet_scrape_concurrency)
 
-    async def _scrape_one(self, raw_username: str, count: int) -> TweetScrapeResult:
+    async def _scrape_one(
+        self, raw_username: str, count: int, window: TimeWindow | None = None
+    ) -> TweetScrapeResult:
+        window = window or resolve_time_window("latest")
         username = normalize_username(raw_username)
         if not is_valid_username(username):
             error = InvalidUsernameError(raw_username)
@@ -65,27 +69,43 @@ class TweetScraper:
             nonlocal attempts
             attempts += 1
 
-            cached = await self.cache.get(username)
-            if cached is not None:
-                for tweet in cached:
-                    tweet.username = username
-                logger.info(f"@{username}: tweets served from cache")
-                return TweetScrapeResult(
-                    username=username,
-                    success=True,
-                    tweets=cached,
-                    attempts=attempts,
-                    from_cache=True,
-                )
+            # The cache is keyed by username only, with a single TTL meant
+            # for "most recent tweets" - it's deliberately bypassed (both
+            # read and write) for a real time window, since caching a
+            # windowed/paginated superset under the same key could later be
+            # served back for an unrelated "latest"/differently-windowed
+            # request. Windowed runs always hit X directly.
+            if not window.is_filtered:
+                cached = await self.cache.get(username)
+                if cached is not None:
+                    for tweet in cached:
+                        tweet.username = username
+                    logger.info(f"@{username}: tweets served from cache")
+                    return TweetScrapeResult(
+                        username=username,
+                        success=True,
+                        tweets=cached,
+                        attempts=attempts,
+                        from_cache=True,
+                    )
 
             async with self._semaphore:
                 await asyncio.sleep(self.settings.request_delay_seconds)
-                tweets = await self.client.get_recent_tweets(username, count=count)
+                if window.is_filtered:
+                    tweets = await self.client.get_recent_tweets(
+                        username,
+                        count=count,
+                        window=window,
+                        max_pages=self.settings.tweet_window_max_pages,
+                    )
+                else:
+                    tweets = await self.client.get_recent_tweets(username, count=count)
 
             for tweet in tweets:
                 tweet.username = username
 
-            await self.cache.set(username, tweets)
+            if not window.is_filtered:
+                await self.cache.set(username, tweets)
             return TweetScrapeResult(
                 username=username, success=True, tweets=tweets, attempts=attempts
             )
@@ -126,15 +146,29 @@ class TweetScraper:
             )
 
     async def scrape_many(
-        self, usernames: Iterable[str], count: int | None = None
+        self,
+        usernames: Iterable[str],
+        count: int | None = None,
+        window: TimeWindow | None = None,
     ) -> list[TweetScrapeResult]:
-        """Fetch recent tweets for all `usernames` concurrently."""
+        """Fetch recent tweets for all `usernames` concurrently.
+
+        `window` defaults to "latest" (no filtering) when omitted, so every
+        existing caller that doesn't pass it keeps the original behavior
+        unchanged. A real window is passed through to each account's fetch
+        (see `_scrape_one`); the returned tweets are the fetched superset,
+        not yet cut to the exact window - `app/category_agent.py` applies
+        `app.time_window.filter_tweets_to_window` once, after aggregating
+        every account's results.
+        """
         usernames = list(usernames)
+        window = window or resolve_time_window("latest")
         count = count if count is not None else self.settings.tweets_per_account
         started_at = time.monotonic()
         logger.info(
             f"Starting tweet scrape for {len(usernames)} account(s) "
-            f"(count={count}, concurrency={self.settings.tweet_scrape_concurrency})"
+            f"(count={count}, concurrency={self.settings.tweet_scrape_concurrency}"
+            f"{', window=' + window.mode if window.is_filtered else ''})"
         )
 
         if not usernames:
@@ -164,7 +198,7 @@ class TweetScraper:
             task_id = progress.add_task("scrape", total=len(usernames))
 
             async def run_one(username: str) -> TweetScrapeResult:
-                result = await self._scrape_one(username, count)
+                result = await self._scrape_one(username, count, window)
                 progress.advance(task_id)
                 return result
 

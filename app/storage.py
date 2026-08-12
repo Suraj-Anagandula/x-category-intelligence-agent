@@ -13,6 +13,7 @@ read the same fields without redesigning this module (spec section 19).
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +35,7 @@ async def save_category_run(
     tweets: list[Tweet],
     settings: Settings,
     discovery_reasons: dict[str, str] | None = None,
+    index_fn: Callable[[list[Tweet], str, datetime], int] | None = None,
 ) -> Path:
     """Persist a category run's profiles, tweets, and report.
 
@@ -44,6 +46,12 @@ async def save_category_run(
     `CategoryTweetCSVExporter`, and a single consolidated
     `{category, scraped_at, accounts, tweets}` snapshot to
     `data/tweets/<category>/<date>.json`. Returns the snapshot path.
+
+    `index_fn`, if given, is called as `index_fn(tweets, category,
+    scraped_at)` right after the snapshot is written (see
+    `app.rag.indexer.index_tweets` for the real implementation, wired in by
+    `CategoryIntelligenceAgent`). Any failure is logged and swallowed -
+    indexing is an optional enhancement, never allowed to fail a scrape run.
     """
     scraped_at = datetime.now(timezone.utc)
     discovery_reasons = discovery_reasons or {}
@@ -86,12 +94,26 @@ async def save_category_run(
         "tweet_statistics": report.tweet_statistics.model_dump(mode="json"),
         "analysis": report.analysis.model_dump(mode="json"),
         "errors": report.errors,
+        # Additive key - a snapshot saved before time-window support existed
+        # simply won't have this; every reader (app/report_compare.py,
+        # app/rag/indexer.py, ui/*) uses `.get("time_window", {})` and must
+        # never assume it's present. `scraped_at` above stays the
+        # collection/run timestamp - "time_window" records the separate
+        # concept of *which tweets this run analyzed*.
+        "time_window": report.time_window.model_dump(mode="json"),
     }
 
     async with aiofiles.open(snapshot_path, "w", encoding="utf-8") as fh:
         await fh.write(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
     logger.info(f"Saved category run for {category!r} to {snapshot_path}")
+
+    if index_fn is not None:
+        try:
+            index_fn(tweets, category, scraped_at)
+        except Exception as exc:  # noqa: BLE001 - indexing must never fail a scrape run
+            logger.warning(f"RAG indexing failed for {category!r}, continuing without it: {exc}")
+
     return snapshot_path
 
 

@@ -9,13 +9,18 @@ stubbing `CategoryIntelligenceAgent`/`TwikitProfileClient`, the same pattern
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
 from app.config import Settings
-from app.logger import get_logger
 from ui import data_loader, pipeline_runner
-from ui.utils import credential_status, format_compact_number, validate_pipeline_params
+from ui.utils import (
+    credential_status,
+    format_compact_number,
+    validate_pipeline_params,
+    validate_time_window_params,
+)
 
 
 def _settings(tmp_path) -> Settings:
@@ -125,6 +130,24 @@ def test_load_latest_run_returns_parsed_snapshot(tmp_path, monkeypatch) -> None:
     assert run["category"] == "sports"
 
 
+def test_load_run_json_accepts_string_path(tmp_path, monkeypatch) -> None:
+    """Regression test: `load_run_history`'s "path" column stores plain
+    strings (`"path": str(path)`), and every caller (Reports' "Load
+    selected run" button, the Compare tab) passes that value straight into
+    `load_run_json` - it must not require an explicit `Path(...)` wrap."""
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(data_loader, "settings", settings)
+    _write_run(tmp_path, "sports", "2026-08-01", accounts=[{"username": "espn"}], tweets=[])
+
+    history = data_loader.load_run_history()
+    row = history.iloc[0]
+    assert isinstance(row["path"], str)
+
+    run = data_loader.load_run_json(row["path"])
+
+    assert run["category"] == "sports"
+
+
 # --- data_loader: CSVs --------------------------------------------------------
 
 
@@ -207,6 +230,32 @@ def test_validate_pipeline_params_rejects_top_accounts_over_candidate_limit() ->
     assert validate_pipeline_params("technology", 10, 20, 10) is not None
 
 
+def test_validate_time_window_params_preset_modes_always_valid() -> None:
+    for mode in ("latest", "24h", "7d", "30d"):
+        assert validate_time_window_params(mode, None, None) is None
+
+
+def test_validate_time_window_params_custom_requires_both_bounds() -> None:
+    now = datetime.now(timezone.utc)
+    assert validate_time_window_params("custom", None, None) is not None
+    assert validate_time_window_params("custom", now, None) is not None
+    assert validate_time_window_params("custom", None, now) is not None
+
+
+def test_validate_time_window_params_custom_start_must_precede_end() -> None:
+    now = datetime.now(timezone.utc)
+    error = validate_time_window_params("custom", now, now - timedelta(days=1))
+
+    assert error is not None
+
+
+def test_validate_time_window_params_valid_custom_range_accepted() -> None:
+    now = datetime.now(timezone.utc)
+    error = validate_time_window_params("custom", now - timedelta(days=7), now)
+
+    assert error is None
+
+
 def test_credential_status_never_leaks_secret_values() -> None:
     settings = Settings()
     settings.x_auth_token = "super-secret-token"
@@ -254,9 +303,10 @@ class _StubReport:
 
 
 class _StubCategoryIntelligenceAgent:
-    """Records how it was called and emits the same log lines the real
-    pipeline does, so run_category_analysis's on_stage wiring is exercised
-    end to end without any real scraping/LLM calls."""
+    """Records how it was called and invokes `on_stage` directly with the
+    same (stage_key, payload) shape the real pipeline does, so
+    run_category_analysis's on_stage wiring is exercised end to end without
+    any real scraping/LLM calls."""
 
     calls: list[dict] = []
 
@@ -264,7 +314,14 @@ class _StubCategoryIntelligenceAgent:
         pass
 
     async def run_pipeline(
-        self, category, candidate_limit=None, top_n=None, tweets_per_account=None
+        self,
+        category,
+        candidate_limit=None,
+        top_n=None,
+        tweets_per_account=None,
+        *,
+        on_stage=None,
+        time_window=None,
     ):
         _StubCategoryIntelligenceAgent.calls.append(
             {
@@ -274,14 +331,14 @@ class _StubCategoryIntelligenceAgent:
                 "tweets_per_account": tweets_per_account,
             }
         )
-        logger = get_logger()
-        logger.info(f"Category context for {category!r}: 3 keyword(s), 2 subcategory(ies)")
-        logger.info("Candidates discovered: 10 (requested up to 10)")
-        logger.info("Profiles validated: 8/10")
-        logger.info("Accounts selected: 5/5")
-        logger.info("Tweet scrape summary:\n  Accounts requested: 5")
-        logger.info("Analysis completed")
-        logger.info("CSV: data/csv/example_tweets.csv")
+        if on_stage is not None:
+            on_stage("context", {"keywords": 3, "subcategories": 2})
+            on_stage("discovery", {"candidates_discovered": 10})
+            on_stage("validation", {"profiles_validated": 8, "profiles_attempted": 10})
+            on_stage("ranking", {"accounts_selected": 5, "top_n_requested": 5})
+            on_stage("tweets", {"tweets_collected": 42, "accounts_failed": 0})
+            on_stage("analysis", {"trending_topics": 3})
+            on_stage("export", {"csv_path": "data/csv/example_tweets.csv"})
         return _StubReport(category)
 
 
@@ -304,8 +361,9 @@ def test_run_category_analysis_invokes_pipeline_with_given_params(tmp_path, monk
 
 
 def test_run_category_analysis_reports_real_stage_progress(tmp_path, monkeypatch) -> None:
-    """Proves progress is driven by the pipeline's own log output, not a
-    simulated/fake timer: every STAGE_MARKERS key must fire, in order."""
+    """Proves progress is driven by the pipeline's own on_stage callback, not
+    a simulated/fake timer: every PIPELINE_STAGES key must fire, in order,
+    each carrying a real (non-empty) payload dict."""
     settings = _pipeline_settings(tmp_path)
 
     _StubCategoryIntelligenceAgent.calls.clear()
@@ -315,8 +373,15 @@ def test_run_category_analysis_reports_real_stage_progress(tmp_path, monkeypatch
         pipeline_runner, "CategoryIntelligenceAgent", _StubCategoryIntelligenceAgent
     )
 
-    seen: list[str] = []
-    pipeline_runner.run_category_analysis("sports", 50, 20, 10, on_stage=seen.append)
+    seen: list[tuple[str, dict]] = []
+    pipeline_runner.run_category_analysis(
+        "sports", 50, 20, 10, on_stage=lambda key, payload: seen.append((key, payload))
+    )
 
-    expected_order = [key for key, _ in pipeline_runner.STAGE_MARKERS]
-    assert seen == expected_order
+    expected_order = [key for key, _ in pipeline_runner.PIPELINE_STAGES]
+    assert [key for key, _ in seen] == expected_order
+    assert all(isinstance(payload, dict) for _, payload in seen)
+
+    tweets_payload = next(payload for key, payload in seen if key == "tweets")
+    assert tweets_payload  # carries real counts, not just a completion marker
+    assert tweets_payload.get("tweets_collected") == 42

@@ -10,6 +10,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from app.utils import split_errors_by_stage
 from ui.pipeline_runner import PIPELINE_STAGES
 from ui.utils import format_compact_number
 
@@ -29,6 +30,14 @@ _ERROR_MESSAGES: dict[str, tuple[str, str]] = {
     "generic": (
         "The category pipeline failed.",
         "",
+    ),
+    "rag_empty": (
+        "No indexed intelligence available yet.",
+        "Run or load an analysis first, then build the index before asking questions.",
+    ),
+    "rag_insufficient": (
+        "The retrieved evidence doesn't clearly answer this question.",
+        "Try a more specific question, or run a new analysis to collect more posts.",
     ),
 }
 
@@ -70,27 +79,62 @@ def render_pipeline_status(done_stages: set[str]) -> None:
 
 def render_run_summary(run_data: dict) -> None:
     """The post-run (or historical-run) headline: success/partial-failure
-    banner plus the real counts - never rounds a partial run up to "complete"."""
+    banner plus the real counts - never rounds a partial run up to "complete".
+
+    "validation"-stage errors (a discovered candidate handle that doesn't
+    exist or is protected, rejected before ranking/selection) are a normal
+    part of dynamic discovery, not a failure of the run's final selected
+    accounts - see `app.utils.split_errors_by_stage`. Only "tweets"-stage
+    errors (a selected account's own tweet collection failing) affect the
+    success/partial-failure banner or count toward "failed during the
+    pipeline run".
+    """
     stats = run_data.get("tweet_statistics", {}) or {}
     errors = run_data.get("errors", []) or []
+    validation_errors, pipeline_errors = split_errors_by_stage(errors)
 
-    if errors:
+    if pipeline_errors:
         st.warning("Analysis completed with partial failures.")
     else:
         st.success("Analysis completed successfully.")
 
     st.markdown(f"**Category:** {run_data.get('category', '-')}")
-    cols = st.columns(5)
+
+    window = run_data.get("time_window") or {}
+    window_mode = window.get("mode", "latest")
+    if window_mode != "latest" and window.get("start") and window.get("end"):
+        start_label = window["start"].split("T")[0]
+        end_label = window["end"].split("T")[0]
+        st.caption(
+            f"**Analysis Window:** {start_label} → {end_label}  ·  "
+            f"{window.get('posts_in_window', 0)} of {window.get('posts_fetched', 0)} "
+            "fetched post(s) were inside this window"
+        )
+
+    cols = st.columns(6)
     cols[0].metric("Accounts Selected", len(run_data.get("accounts", [])))
     cols[1].metric("Succeeded", stats.get("accounts_processed", 0))
     cols[2].metric("Rate Limited", stats.get("accounts_rate_limited", 0))
-    cols[3].metric("Other Failures", stats.get("accounts_failed_other", 0))
-    cols[4].metric("Tweets Collected", stats.get("tweets_collected", 0))
+    cols[3].metric("Pipeline Failures", stats.get("accounts_failed", 0))
+    cols[4].metric("Candidate Validation Issues", len(validation_errors))
+    cols[5].metric("Tweets Collected", stats.get("tweets_collected", 0))
 
-    if errors:
-        st.warning(f"⚠ {len(errors)} account(s) failed during the pipeline run.")
-        with st.expander("Failure detail"):
-            st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
+    if pipeline_errors:
+        st.warning(
+            f"⚠ {len(pipeline_errors)} of the selected account(s) failed during tweet "
+            "collection (the pipeline run itself)."
+        )
+        with st.expander("Pipeline failure detail"):
+            st.dataframe(pd.DataFrame(pipeline_errors), width="stretch", hide_index=True)
+
+    if validation_errors:
+        st.caption(
+            f"{len(validation_errors)} candidate account(s) discovered for this category were "
+            "rejected during validation (e.g. not found, protected) before ranking - they were "
+            "never part of the final selected accounts above."
+        )
+        with st.expander("Candidate validation detail"):
+            st.dataframe(pd.DataFrame(validation_errors), width="stretch", hide_index=True)
 
 
 def render_account_table(accounts: list[dict]) -> None:
@@ -113,22 +157,6 @@ def render_account_table(accounts: list[dict]) -> None:
         }
     )
     st.dataframe(display, width="stretch", hide_index=True)
-
-
-def render_account_card(account: dict) -> None:
-    st.subheader(f"@{account.get('username', 'unknown')}")
-    if account.get("display_name"):
-        st.caption(account["display_name"])
-
-    cols = st.columns(3)
-    cols[0].metric("Followers", format_compact_number(account.get("followers")))
-    cols[1].metric("Category Relevance", f"{account.get('category_relevance', 0):.1f}")
-    cols[2].metric("Ranking Score", f"{account.get('ranking_score', 0):.1f}")
-
-    reason = account.get("discovery_reason")
-    if reason:
-        st.markdown("**Discovery Reason**")
-        st.info(reason)
 
 
 def render_tweet_card(tweet: dict) -> None:

@@ -34,18 +34,24 @@ def list_run_files(category: str | None = None) -> list[Path]:
     return sorted(files, key=lambda path: path.stat().st_mtime, reverse=True)
 
 
-def load_run_json(path: Path) -> dict:
+def load_run_json(path: Path | str) -> dict:
     """Parse a single saved run snapshot (the same format `save_category_run`
-    in app/storage.py writes)."""
-    return json.loads(path.read_text(encoding="utf-8"))
+    in app/storage.py writes). Accepts a `str` as well as a `Path` - callers
+    commonly pass a `history_df["path"]` value, which is stored as a plain
+    string (see `load_run_history` below)."""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def load_run_history() -> pd.DataFrame:
-    """One row per saved run across all categories, newest first - for the
-    Run History table. Skips any file that fails to parse rather than
-    aborting the whole listing."""
+def load_run_history(category: str | None = None) -> pd.DataFrame:
+    """One row per saved run, newest first - for the Reports/Compare pages.
+
+    If `category` is given, only that category's runs (used by Compare's
+    date pickers and Ask Intelligence's category scoping); omitted/`None`
+    preserves the original "all categories" behavior. Skips any file that
+    fails to parse rather than aborting the whole listing.
+    """
     rows = []
-    for path in list_run_files():
+    for path in list_run_files(category):
         try:
             data = load_run_json(path)
         except (OSError, json.JSONDecodeError):

@@ -40,3 +40,20 @@ browser_cookie3>=0.19.1
 # (main.py) has no dependency on these and keeps working without them.
 streamlit>=1.38
 plotly>=5.24
+
+# Ask Intelligence (RAG) - only imported lazily by app/rag/*, the same
+# lazy-import pattern as groq/google-genai above. Not pinned exactly - no
+# fragile reverse-engineered API surface here. sentence-transformers pulls in
+# a CPU torch wheel (several hundred MB); the embedding model itself
+# (all-MiniLM-L6-v2, ~80MB) downloads on first real use, not at install time.
+# torchvision is required transitively: sentence-transformers depends on
+# transformers, and transformers/models/zoedepth/image_processing_zoedepth.py
+# unconditionally imports `torchvision.transforms.v2` - without it, certain
+# transformers code paths raise ModuleNotFoundError even though this project
+# only ever loads a text embedding model, never a vision model. Left
+# unpinned so pip keeps it paired with whichever torch version
+# sentence-transformers pulls in (torchvision's own metadata pins an exact
+# matching torch release per version).
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+torchvision>=0.17.0
